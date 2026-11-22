@@ -281,6 +281,8 @@ export interface RedactResult {
   sanitized: string;
   redactions: Redaction[];
   logs: StepLog[];
+  /** True only if the on-device contextual pass actually succeeded. */
+  modelRan: boolean;
 }
 
 /**
@@ -303,14 +305,21 @@ export async function redact(raw: string, device: DeviceStatus, pmode: Processin
     const MAX_CHUNKS = 6;
     const parts = chunk(text, 5000);
     const found: { kind: string; value: string }[] = [];
+    let ok = 0;
     for (const part of parts.slice(0, MAX_CHUNKS)) {
       try {
         const res = await scrubModel().generateContent(`LOG:\n${part}`);
         const items = (JSON.parse(res.response.text()) as { items?: { kind: string; value: string }[] }).items ?? [];
         found.push(...items);
+        ok++;
       } catch (e) {
         console.warn("on-device scrub chunk failed", e);
       }
+    }
+    if (ok === 0) {
+      // Never claim on-device redaction that didn't happen; the caller asks the user to review.
+      logs.push({ step: "redact_model", source: "skipped", ms: now() - t, note: "Gemini Nano failed: rule-based redaction only" });
+      return { redactor: r, sanitized: text, redactions: r.redactions, logs, modelRan: false };
     }
     text = r.applyLiterals(text, found);
     logs.push({
@@ -320,7 +329,7 @@ export async function redact(raw: string, device: DeviceStatus, pmode: Processin
       note: parts.length > MAX_CHUNKS ? `scanned first ${MAX_CHUNKS} of ${parts.length} chunks; rest rule-based` : undefined,
     });
   }
-  return { redactor: r, sanitized: text, redactions: r.redactions, logs };
+  return { redactor: r, sanitized: text, redactions: r.redactions, logs, modelRan: logs.some((l) => l.step === "redact_model" && l.source === "on_device") };
 }
 
 const ERROR_HINT =

@@ -212,7 +212,7 @@ private fun parseJson(text: String?): JSONObject {
 /* Steps                                                                */
 /* ------------------------------------------------------------------ */
 
-class RedactResult(val redactor: Redactor, val sanitized: String, val logs: List<StepLog>)
+class RedactResult(val redactor: Redactor, val sanitized: String, val logs: List<StepLog>, val modelRan: Boolean = false)
 
 private fun chunk(text: String, size: Int): List<String> {
     val out = mutableListOf<String>()
@@ -246,6 +246,7 @@ suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg:
     val maxChunks = 4
     val parts = chunk(text, 3_000)
     val found = mutableListOf<Pair<String, String>>()
+    var ok = 0
     for (part in parts.take(maxChunks)) {
         try {
             val res = scrubModel(cfg).generateContent(SCRUB_PROMPT + part)
@@ -254,9 +255,15 @@ suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg:
                 val o = items!!.getJSONObject(i)
                 found += o.optString("kind", "PII") to o.optString("value")
             }
+            ok++
         } catch (e: Exception) {
             android.util.Log.w("TraceLens", "on-device scrub chunk failed", e)
         }
+    }
+    if (ok == 0) {
+        // Never claim on-device redaction that didn't happen; the caller asks the user to review.
+        logs += StepLog("Redact context (AI)", StepSource.SKIPPED, System.currentTimeMillis() - t, "Gemini Nano failed: rule-based redaction only")
+        return RedactResult(r, text, logs, modelRan = false)
     }
     text = r.applyLiterals(text, found)
     logs += StepLog(
@@ -265,7 +272,7 @@ suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg:
         System.currentTimeMillis() - t,
         if (parts.size > maxChunks) "scanned first $maxChunks of ${parts.size} chunks; rest rule-based" else null,
     )
-    return RedactResult(r, text, logs)
+    return RedactResult(r, text, logs, modelRan = true)
 }
 
 suspend fun triage(sanitized: String, cfg: RoutingConfig, mode: ProcessingMode): Pair<Triage, StepLog> {

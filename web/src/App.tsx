@@ -261,7 +261,8 @@ export default function App() {
       }
       // Without Gemini Nano only rules ran, and the next step goes to the cloud:
       // let the user check (and hide more) before anything leaves the device.
-      if (!nano) {
+      if (!nano || !red.modelRan) {
+        if (mode === "private") throw new Error("Gemini Nano couldn't redact this trace, and Private mode never uses the cloud.");
         step({ pending: null, review: true });
         return;
       }

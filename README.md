@@ -105,7 +105,7 @@ firebase deploy --only hosting,firestore:rules,remoteconfig
 
 ## Platforms
 
-Both apps share one Firebase project, the same Firestore layout (`users/{uid}/traces`, tagged `platform: web | android`) and the same Remote Config routing knobs.
+All three apps share one Firebase project, the same Firestore layout (`users/{uid}/traces`, tagged `platform: web | android | ios`) and the same Remote Config routing knobs.
 
 ### Web (Chrome): [web/](web/)
 Gemini Nano through Chrome's Prompt API. See *Run it* above.
@@ -131,6 +131,27 @@ Build and run:
 3. On first launch, logcat prints an App Check debug token. Register it with `firebase appcheck:debugtokens:create <token> --app <android app id>`.
 
 Gemini Nano runs on AICore devices (e.g. Pixel 9+, Galaxy S24+). Other phones fall back to the cloud automatically, with the review step.
+
+### iOS (Swift, SwiftUI): [ios/](ios/)
+Uses **Firebase AI Logic's `GeminiLanguageModel`** together with **Apple's Foundation Models framework**. Since Firebase SDK 13, Gemini plugs directly into Apple's `LanguageModelSession`, so the on-device model and the cloud model share one API:
+
+| Step | iOS API |
+|---|---|
+| On-device model | `SystemLanguageModel.default` (Apple Intelligence); availability via `.availability` |
+| Cloud model | `FirebaseAI.firebaseAI(backend: .googleAI()).geminiLanguageModel(name:)` (App Check protected) |
+| Contextual redaction | `LanguageModelSession(model: SystemLanguageModel.default, …)`, on-device only |
+| Triage | the same `respond(to:generating: Triage.self)` against Apple Intelligence or Gemini, depending on mode and availability; falls back to Gemini in Hybrid |
+| Structured output | `@Generable` / `@Guide` Swift types, shared by both models |
+| Deep dive | Gemini `LanguageModelSession.streamResponse` |
+
+Key code: [Pipeline.swift](ios/TraceLens/Pipeline.swift).
+
+Build and run (Xcode 27, iOS 27 SDK):
+1. Add an iOS app with bundle ID `dev.tracelens.ios` in the Firebase console and put `GoogleService-Info.plist` in `ios/TraceLens/`. It is git-ignored.
+2. Run `cd ios && xcodegen generate && open TraceLens.xcodeproj`, then run on an iPhone or simulator.
+3. App Check: debug builds use the debug provider. Set `FIRAAppCheckDebugToken` in the scheme's environment, and register that token with `firebase appcheck:debugtokens:create`.
+
+Apple Intelligence inference runs on real devices only (iPhone 15 Pro or newer). The iOS Simulator reports the model as available but refuses inference, so TraceLens treats the Simulator as having no on-device AI and uses Gemini with the review step.
 
 ## License
 

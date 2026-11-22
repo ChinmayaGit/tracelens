@@ -205,8 +205,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 redactor = red.redactor
                 setRun { it.copy(sanitized = red.sanitized, redactions = red.redactor.redactions, steps = red.logs) }
 
-                if (!nano) {
-                    // Only rules ran and the next step is the cloud: let the user check first.
+                if (!nano || !red.modelRan) {
+                    if (mode == ProcessingMode.PRIVATE) error("Gemini Nano couldn't redact this trace, and Private mode never uses the cloud.")
+                    // Only rules ran and the next step may be the cloud: let the user check first.
                     setRun { it.copy(pending = null, review = true) }
                     return@launch
                 }

@@ -13,3 +13,7 @@ android/local.properties
 android/app/google-services.json
 android/.kotlin/
 android/app/release/
+ios/TraceLens/GoogleService-Info.plist
+ios/*.xcodeproj/
+ios/build/
+ios/DerivedData/
