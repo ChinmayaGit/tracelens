@@ -8,9 +8,23 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 
 **Live demo:** https://tracelens-e8e9a.web.app (desktop Chrome recommended)
 
-| Web | Android | iOS |
-|---|---|---|
-| ![Web](docs/screenshots/web-home.png) | ![Android](docs/screenshots/android-home.jpg) | ![iOS](docs/screenshots/ios-home.png) |
+<p align="center">
+  <img src="docs/screenshots/web-home.png" width="440" alt="Web">
+  <img src="docs/screenshots/android-home.jpg" width="200" alt="Android">
+  <img src="docs/screenshots/ios-home.png" width="200" alt="iOS">
+</p>
+<p align="center"><sub>Web (Chrome + Gemini Nano) · Android (Qwen 2.5 on the phone) · iOS</sub></p>
+
+### Local AI on every platform
+
+Private mode keeps every AI step off the cloud. Real runs: **Android** on a Realme X50 Pro (no Gemini Nano) and **iOS** in the iPhone 18 Pro simulator.
+
+| Android · Qwen 2.5 **on the phone** | Android · Llama 3.2 **on a network server** | iOS · Llama 3.2 **on a network server** | iOS · private deep dive |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/screenshots/android-pipeline.jpg" width="200" alt="Android on-phone pipeline"> | <img src="docs/screenshots/android-lan-pipeline.jpg" width="200" alt="Android network pipeline"> | <img src="docs/screenshots/ios-local-network.png" width="200" alt="iOS network pipeline"> | <img src="docs/screenshots/ios-lan-deepdive.jpg" width="200" alt="iOS deep dive"> |
+| redaction ~18 s · triage ~9 s | redaction 9.4 s · triage 4.3 s | redaction 9 s · triage 6.6 s | root cause + code fix |
+
+*On a real iPhone 15 Pro or newer, iOS uses Apple Intelligence on-device; the Simulator can't run Apple's model, so the iOS shots use the network server.*
 
 ---
 
@@ -21,12 +35,13 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 3. [Try it in 2 minutes](#try-it-in-2-minutes)
 4. [Set up Gemini Nano in Chrome](#set-up-gemini-nano-in-chrome)
 5. [Bigger models on your local network](#bigger-models-on-your-local-network)
-6. [Debug your installed apps](#debug-your-installed-apps)
-7. [Firebase setup](#firebase-setup-run-your-own-copy)
-8. [Run & build each platform](#run--build-each-platform)
-9. [How it works](#how-it-works)
-10. [Abuse protection & cost caps](#abuse-protection--cost-caps)
-11. [Limitations](#limitations)
+6. [Open models on the phone (Google AI Edge)](#open-models-on-the-phone-google-ai-edge)
+7. [Debug your installed apps](#debug-your-installed-apps)
+8. [Firebase setup](#firebase-setup-run-your-own-copy)
+9. [Run & build each platform](#run--build-each-platform)
+10. [How it works](#how-it-works)
+11. [Abuse protection & cost caps](#abuse-protection--cost-caps)
+12. [Limitations](#limitations)
 
 ---
 
@@ -61,7 +76,7 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 | **What the cloud sees / Kept on this device** | The exact sanitized text sent out, with `[PLACEHOLDERS]` highlighted, plus the list of hidden values (masked) and who caught each one: `rule`, `Gemini Nano` / `Apple Intelligence`, or `you`. In Private mode it's labelled *Sanitized trace (stays private)*. |
 | **History** | Your sanitized traces, synced through Firestore and tagged `web` / `android` / `ios`. |
 
-**Pipeline badge legend:** 🟣 **Local rules** (regex, instant) · 🟢 **On-device** (Gemini Nano / Apple Intelligence) · 🔷 **Local network server** (your own machine) · 🔵 **Cloud · Gemini** · ⚪ **Skipped** (with the reason).
+**Pipeline badge legend:** 🟣 **Local rules** (regex, instant) · 🟢 **On-device** (Gemini Nano / Apple Intelligence / **AI Edge** model on the phone) · 🔷 **Local network server** (your own machine) · 🔵 **Cloud · Gemini** · ⚪ **Skipped** (with the reason).
 
 ### Hiding things before you show or share a trace
 1. Secrets matching known patterns (keys, tokens, passwords, emails, phones, IPs, names after labels like `customer=`) are replaced automatically, e.g. `[AWS_KEY_1]`.
@@ -70,12 +85,12 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 4. Placeholders are stable (the same secret always gets the same placeholder), so the AI can still reason about the trace. The originals stay in memory on your device and are **never stored** in Firestore.
 
 | Review & hide (web) | Result (web) |
-|---|---|
-| ![Review](docs/screenshots/web-review.png) | ![Result](docs/screenshots/web-result.png) |
+|:---:|:---:|
+| <img src="docs/screenshots/web-review.png" width="420" alt="Review"> | <img src="docs/screenshots/web-result.png" width="420" alt="Result"> |
 
-| Android: pipeline | Android: triage | Android: redacted trace | iOS: local network server |
-|---|---|---|---|
-| ![](docs/screenshots/android-pipeline.jpg) | ![](docs/screenshots/android-triage.jpg) | ![](docs/screenshots/android-redacted.jpg) | ![](docs/screenshots/ios-local-network.png) |
+| Android: triage | Android: redacted trace | Android: crash import |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/android-triage.jpg" width="200" alt="Triage"> | <img src="docs/screenshots/android-redacted.jpg" width="200" alt="Redacted trace"> | <img src="docs/screenshots/android-crashes.jpg" width="200" alt="Crash import"> |
 
 ---
 
@@ -140,7 +155,36 @@ OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve # listen on the network, allow
 - **Android:** cleartext HTTP is allowed so it can reach the server (Firebase traffic stays HTTPS).
 - **iOS:** asks for **Local Network** permission the first time.
 
+<p><img src="docs/screenshots/ios-settings-lan.jpg" width="200" alt="iOS local server settings"></p>
+
 **Android:** besides network models, ⚙ Settings lets you pick the Gemini Nano build: **Stable** (default), **Fast** (smaller, `PREVIEW_FAST`) or **Latest** (larger, `PREVIEW`). The preview builds need the AICore developer preview.
+
+---
+
+## Open models on the phone (Google AI Edge)
+
+**Android only.** Most phones don't have Gemini Nano (it needs AICore: Pixel 9+, Galaxy S24+ and similar). TraceLens can instead **download an open model and run it on the phone itself**, using Google's **MediaPipe LLM Inference** runtime, the same one the *Google AI Edge Gallery* app uses. Private mode then works on almost any recent Android phone, offline, with nothing leaving the device.
+
+⚙ Settings → **On-device model (Google AI Edge)** → **Download** a model → it becomes the private engine. The header shows e.g. **Qwen 2.5 · on-device**.
+
+| Model | Download | Min phone RAM | Access |
+|---|---|---|---|
+| Gemma 3 1B (int4) | 0.55 GB | 3 GB | Hugging Face token |
+| **Qwen 2.5 1.5B Instruct** (recommended) | 1.6 GB | 4 GB | free |
+| Gemma 3n E2B (int4), AI Edge Gallery's headline model | 3.1 GB | 6 GB | Hugging Face token |
+| Phi-4-mini Instruct | 3.9 GB | 8 GB | free |
+
+- The app shows the phone's RAM and warns when a model needs more.
+- Downloads are resumable (Pause / Download again), and **Delete** frees the space.
+- Gemma models are free but gated: accept the license on huggingface.co, create a *Read* token, and paste it in Settings. It's stored only on the phone.
+- The model runs on the GPU when possible and falls back to the CPU.
+- **Measured on a Realme X50 Pro (Snapdragon 865, 8 GB)** with Qwen 2.5 1.5B: about 18 s for contextual redaction, about 9 s for triage. It caught the username, internal hostname, organisation and customer ID that the rules missed.
+- **Quality note:** 1–2B models give useful triage but can invent details (e.g. a database name). Use **Hybrid** for a cloud deep dive, or a bigger model (Gemma 3n, or a [network server](#bigger-models-on-your-local-network)), when it matters.
+- *Why not Firebase AI Logic here?* AI Logic's on-device path is Gemini Nano. AI Edge is an extra local engine for phones without Nano. Cloud calls still go through Firebase AI Logic with App Check.
+
+| Model picker | Private mode on Qwen 2.5 | Network server (Android) | Private deep dive on the network |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/screenshots/android-edge-models.jpg" width="200" alt="Model picker"> | <img src="docs/screenshots/android-home.jpg" width="200" alt="Private on Qwen"> | <img src="docs/screenshots/android-lan-home.jpg" width="200" alt="LAN online"> | <img src="docs/screenshots/android-lan-deepdive.jpg" width="200" alt="Network deep dive"> |
 
 ---
 
@@ -151,6 +195,8 @@ OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve # listen on the network, allow
 adb shell pm grant dev.tracelens android.permission.READ_LOGS
 ```
 Without the grant you only see TraceLens's own crashes; the app shows the command with a Copy button. You can also **share** any crash text to TraceLens from another app.
+
+> **Realme / OPPO / OnePlus:** the grant fails with `SecurityException … GRANT_RUNTIME_PERMISSIONS` until you enable **Developer options → Disable permission monitoring**. **Xiaomi:** enable **USB debugging (Security settings)**.
 
 **iOS:** Apple's sandbox doesn't let apps read other apps' crash logs. Export a crash from **Settings → Privacy & Security → Analytics Data** (or Xcode → Devices), then tap 🐞 to import the `.ips` / `.crash` / `.log` file.
 
@@ -254,6 +300,7 @@ input (text / .log / screenshot / shared crash)
 | Hybrid pipeline | [pipeline.ts](web/src/lib/pipeline.ts) | [Pipeline.kt](android/app/src/main/java/dev/tracelens/Pipeline.kt) | [Pipeline.swift](ios/TraceLens/Pipeline.swift) |
 | Redaction rules | [redact.ts](web/src/lib/redact.ts) | [Redactor.kt](android/app/src/main/java/dev/tracelens/Redactor.kt) | [Redactor.swift](ios/TraceLens/Redactor.swift) |
 | Local network engine | [local.ts](web/src/lib/local.ts) | [Lan.kt](android/app/src/main/java/dev/tracelens/Lan.kt) | [Lan.swift](ios/TraceLens/Lan.swift) |
+| On-phone open models (AI Edge) | — | [Edge.kt](android/app/src/main/java/dev/tracelens/Edge.kt) | — |
 | Rate limiting | [quota.ts](web/src/lib/quota.ts) | [Quota.kt](android/app/src/main/java/dev/tracelens/Quota.kt) | [Store.swift](ios/TraceLens/Store.swift) |
 | Installed-app crashes | — | [Crashes.kt](android/app/src/main/java/dev/tracelens/Crashes.kt) | file import |
 
@@ -276,7 +323,8 @@ Cloud calls are rate-limited by **Firestore security rules**, so the limits hold
 - On-device model availability is decided by Chrome / AICore / Apple, not by the app. TraceLens detects it and falls back.
 - Gemini Nano and Apple Intelligence memory usage can't be controlled by apps. The memory-saver toggle applies to local-network models.
 - Web pages can't open `chrome://` pages or reach `http://` LAN servers from HTTPS (browser security). The app explains the workaround.
-- Reading other apps' crashes needs a one-time `adb` grant on Android and isn't possible on iOS.
+- Reading other apps' crashes needs a one-time `adb` grant on Android (plus an OEM setting on Realme/OPPO/Xiaomi) and isn't possible on iOS.
+- Small on-phone models (1–2B) can invent details; treat their triage as a first guess.
 
 ## License
 

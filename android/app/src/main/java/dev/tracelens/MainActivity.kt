@@ -131,6 +131,7 @@ fun TraceLensTheme(content: @Composable () -> Unit) {
 private fun sourceColor(s: StepSource) = when (s) {
     StepSource.ON_DEVICE -> DeviceGreen
     StepSource.LOCAL_NETWORK -> Color(0xFF0E7490)
+    StepSource.EDGE -> DeviceGreen
     StepSource.IN_CLOUD -> CloudBlue
     StepSource.LOCAL_RULES -> RulesPurple
     StepSource.SKIPPED -> Color.Gray
@@ -163,7 +164,11 @@ fun Screen(vm: MainViewModel) {
                     }
                 },
                 actions = {
-                    if (ui.useNetwork) {
+                    val edge = EDGE_MODELS.firstOrNull { it.id == ui.edgeModelId }
+                    if (ui.useEdge) {
+                        Badge(if (edge != null && edge.id in ui.edgeInstalled) "${edge.shortName} · on-device" else "No model",
+                            if (edge != null && edge.id in ui.edgeInstalled) DeviceGreen else Warn, Modifier.padding(end = 4.dp))
+                    } else if (ui.useNetwork) {
                         Badge(if (ui.lanStatus?.online == true) "LAN online" else "LAN offline",
                             if (ui.lanStatus?.online == true) Color(0xFF0E7490) else Bad, Modifier.padding(end = 4.dp))
                     } else DevicePill(ui.device)
@@ -184,7 +189,13 @@ fun Screen(vm: MainViewModel) {
             run.error?.let { item { ErrorBanner(it, ui.refreshing, vm::refresh) } }
             if (run.steps.isNotEmpty() || run.pending != null) item { PipelineCard(run) }
             if (run.review) item { ReviewCard(run, vm) }
-            run.triage?.let { t -> item { TriageCard(t, canEscalate = run.analysis.isEmpty() && run.pending == null && ui.mode != ProcessingMode.PRIVATE, vm) } }
+            run.triage?.let { t -> item { TriageCard(t, canEscalate = run.analysis.isEmpty() && run.pending == null &&
+                (ui.mode != ProcessingMode.PRIVATE || ui.useEdge || ui.useNetwork),
+                deepLabel = when {
+                    ui.mode != ProcessingMode.PRIVATE -> "Deep dive in cloud →"
+                    ui.useNetwork -> "Deep dive on my network →"
+                    else -> "Deep dive on-device →"
+                }, vm = vm) } }
             if (run.analysis.isNotEmpty()) item { Section("Root-cause analysis") { MarkdownText(run.analysis) } }
             if (run.sanitized.isNotEmpty() && !run.review) item { SanitizedCard(run, ui.mode == ProcessingMode.PRIVATE) }
             item { Text("History", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp)) }
@@ -280,7 +291,9 @@ private fun ModeCard(ui: UiState, vm: MainViewModel) {
                 SegmentedButton(
                     selected = ui.mode == m,
                     onClick = { vm.setMode(m) },
-                    enabled = m != ProcessingMode.PRIVATE || ui.device == DeviceStatus.AVAILABLE,
+                    // Private needs some local model: Gemini Nano, a downloaded AI Edge model, or an online network server.
+                    enabled = m != ProcessingMode.PRIVATE || ui.device == DeviceStatus.AVAILABLE ||
+                        (ui.useEdge && ui.edgeModelId in ui.edgeInstalled) || (ui.useNetwork && ui.lanStatus?.online == true),
                     shape = SegmentedButtonDefaults.itemShape(i, ProcessingMode.entries.size),
                 ) { Text(m.name.lowercase().replaceFirstChar { it.uppercase() }) }
             }
@@ -294,6 +307,13 @@ private fun ModeCard(ui: UiState, vm: MainViewModel) {
                 if (p >= 0f) LinearProgressIndicator(progress = { p }, Modifier.fillMaxWidth())
                 else LinearProgressIndicator(Modifier.fillMaxWidth())
                 TextButton(onClick = vm::cancelDownload) { Text("Cancel") }
+            }
+            ui.useEdge -> {
+                val m = EDGE_MODELS.firstOrNull { it.id == ui.edgeModelId }
+                if (m != null && m.id in ui.edgeInstalled) Banner(
+                    "Private steps run on ${m.name} on this phone (Google AI Edge). Nothing leaves the device" +
+                        (if (ui.mode == ProcessingMode.PRIVATE) ", including deep dives." else "."), DeviceGreen)
+                else Banner("No on-device model downloaded yet. Open ⚙ Settings → On-device model.", Warn)
             }
             ui.useNetwork -> Banner(
                 if (ui.lanStatus?.online == true)
@@ -370,12 +390,15 @@ private fun InputCard(ui: UiState, vm: MainViewModel) {
                 Icon(Icons.Default.Close, contentDescription = "Clear")
             }
             Spacer(Modifier.weight(1f))
-            Text("${ui.cloudLeft}/$USER_DAILY_LIMIT cloud left", fontSize = 11.sp, color = Color.Gray,
-                modifier = Modifier.padding(end = 8.dp))
-            Button(onClick = vm::analyze, enabled = ui.uid != null && ui.run.pending == null && ui.input.isNotBlank()) {
-                Text(if (ui.run.pending != null) "Working…" else "Analyze privately")
+            Button(
+                onClick = vm::analyze, enabled = ui.uid != null && ui.run.pending == null && ui.input.isNotBlank(),
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp),
+            ) {
+                Text(if (ui.run.pending != null) "Working…" else "Analyze privately", maxLines = 1, softWrap = false, fontSize = 15.sp)
             }
         }
+        Text("${ui.cloudLeft}/$USER_DAILY_LIMIT cloud runs left today · on-device is unlimited", fontSize = 11.sp,
+            color = Color.Gray, modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.End)
     }
 }
 
@@ -452,7 +475,7 @@ private fun FlowRowButtons(hideLabel: String?, onHide: () -> Unit, onSend: () ->
 }
 
 @Composable
-private fun TriageCard(t: Triage, canEscalate: Boolean, vm: MainViewModel) {
+private fun TriageCard(t: Triage, canEscalate: Boolean, deepLabel: String, vm: MainViewModel) {
     Section(accent = sevColor(t.severity)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -473,7 +496,7 @@ private fun TriageCard(t: Triage, canEscalate: Boolean, vm: MainViewModel) {
             modifier = Modifier.fillMaxWidth().height(6.dp),
         )
         Text("$pct% confident", fontSize = 12.sp)
-        if (canEscalate) Button(onClick = vm::deepDive) { Text("Deep dive in cloud →") }
+        if (canEscalate) Button(onClick = vm::deepDive) { Text(deepLabel) }
     }
 }
 
@@ -596,17 +619,23 @@ private fun SettingsSheet(ui: UiState, vm: MainViewModel) {
             Text("Used for private steps (redaction, triage). The cloud is only used in Hybrid/Cloud mode.",
                 fontSize = 12.sp, color = Color.Gray)
 
-            RadioRow(!ui.useNetwork, "Built-in: Gemini Nano (default)",
+            RadioRow(!ui.useNetwork && !ui.useEdge, "Built-in: Gemini Nano (default)",
                 "Runs on this phone via AICore. Needs a supported device (Pixel 9+, Galaxy S24+…), ~3 GB free storage.") {
                 vm.setUseNetwork(false)
             }
-            if (!ui.useNetwork) {
+            if (!ui.useNetwork && !ui.useEdge) {
                 NanoOption.entries.forEach { o ->
                     Row(Modifier.padding(start = 28.dp)) {
                         RadioRow(ui.nano == o, o.label, o.detail) { vm.setNano(o) }
                     }
                 }
             }
+            RadioRow(ui.useEdge, "On-device model (Google AI Edge)",
+                "Download an open model (Gemma, Qwen, Phi) and run it on this phone, like the AI Edge Gallery app. " +
+                    "Works on phones without Gemini Nano. This phone has ${"%.1f".format(ui.ramGb)} GB RAM.") {
+                vm.setUseEdge(true)
+            }
+            if (ui.useEdge) EdgeSettings(ui, vm)
             RadioRow(ui.useNetwork, "Bigger model on my network",
                 "A powerful computer on your Wi-Fi runs the model (Ollama). Nothing leaves your network.") {
                 vm.setUseNetwork(true)
@@ -686,7 +715,9 @@ private fun CrashesSheet(ui: UiState, vm: MainViewModel) {
             Text("Recent app crashes", style = MaterialTheme.typography.titleLarge)
             if (!ui.crashesAllApps) {
                 Banner("Android only lets TraceLens read other apps' crashes after a one-time grant from a computer " +
-                    "(USB debugging on). Until then you only see TraceLens's own crashes.", Warn)
+                    "(USB debugging on). Until then you only see TraceLens's own crashes.\n\n" +
+                    "Realme / OPPO / OnePlus: first enable Developer options → Disable permission monitoring. " +
+                    "Xiaomi: enable USB debugging (Security settings).", Warn)
                 Text(Crashes.GRANT_COMMAND, fontFamily = Mono, fontSize = 11.sp,
                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
                         .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)).padding(8.dp))
@@ -711,5 +742,56 @@ private fun CrashesSheet(ui: UiState, vm: MainViewModel) {
             }
             Text("Tap a crash to load it. It's redacted before any AI sees it.", fontSize = 12.sp, color = Color.Gray)
         }
+    }
+}
+
+
+@Composable
+private fun EdgeSettings(ui: UiState, vm: MainViewModel) {
+    Column(Modifier.padding(start = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        EDGE_MODELS.forEach { m ->
+            val installed = m.id in ui.edgeInstalled
+            val progress = ui.edgeProgress[m.id]
+            val tooBig = ui.ramGb > 0 && ui.ramGb + 0.5 < m.minRamGb
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.RadioButton(
+                            selected = ui.edgeModelId == m.id, enabled = installed, onClick = { vm.setEdgeModel(m.id) })
+                        Column(Modifier.weight(1f)) {
+                            Text(m.name, fontWeight = FontWeight.Medium)
+                            Text("${m.sizeGb} GB download · needs ${m.minRamGb} GB RAM" + if (m.needsToken) " · Hugging Face token" else " · free",
+                                fontSize = 11.sp, color = Color.Gray)
+                        }
+                    }
+                    Text(m.note, fontSize = 12.sp)
+                    if (tooBig) Text("⚠ This phone has less RAM than recommended; it may be slow or fail to load.", fontSize = 11.sp, color = Warn)
+                    when {
+                        progress != null -> {
+                            LinearProgressIndicator(progress = { progress }, Modifier.fillMaxWidth())
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Downloading ${(progress * 100).toInt()}%", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { vm.cancelEdgeDownload(m) }) { Text("Pause") }
+                            }
+                        }
+                        installed -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Badge("Downloaded", DeviceGreen)
+                            TextButton(onClick = { vm.deleteEdge(m) }) { Text("Delete") }
+                        }
+                        else -> OutlinedButton(onClick = { vm.downloadEdge(m) }) { Text("Download") }
+                    }
+                }
+            }
+        }
+        if (EDGE_MODELS.any { it.needsToken && it.id !in ui.edgeInstalled }) {
+            OutlinedTextField(
+                value = ui.hfToken, onValueChange = vm::setHfToken, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                label = { Text("Hugging Face token (for Gemma models)") },
+                placeholder = { Text("hf_…") },
+            )
+            Text("Gemma is free but gated: accept its license on huggingface.co, then create a Read token in your " +
+                "Hugging Face settings. The token stays on this phone.", fontSize = 11.sp, color = Color.Gray)
+        }
+        ui.notice?.let { Text(it, fontSize = 12.sp, color = DeviceGreen) }
     }
 }

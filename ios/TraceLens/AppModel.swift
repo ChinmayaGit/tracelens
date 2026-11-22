@@ -89,6 +89,7 @@ final class AppModel {
             // Test hook for headless simulator runs: TL_AUTORUN=<sample index> [TL_MODE=cloud|hybrid|private]
             let env = ProcessInfo.processInfo.environment
             if let m = env["TL_MODE"].flatMap(ProcessingMode.init(rawValue:)) { self.mode = m }
+            if env["TL_SETTINGS"] != nil { self.showSettings = true }
             if let url = env["TL_LAN"] {
                 self.lan.url = url
                 self.useNetwork = true
@@ -98,6 +99,11 @@ final class AppModel {
                 self.input = samples[i].1
                 while self.uid == nil { try? await Task.sleep(for: .milliseconds(300)) }
                 self.analyze()
+                if env["TL_DEEP"] != nil {
+                    while self.run.triage == nil && self.run.error == nil { try? await Task.sleep(for: .milliseconds(300)) }
+                    while self.run.pending != nil { try? await Task.sleep(for: .milliseconds(300)) }
+                    if self.run.analysis.isEmpty { self.startDeepDive() }
+                }
                 if env["TL_AUTOSEND"] != nil {
                     while !self.run.review && self.run.pending != nil { try? await Task.sleep(for: .milliseconds(300)) }
                     if self.run.review { self.approveAndSend() }
@@ -186,8 +192,8 @@ final class AppModel {
                 run.sanitized = red.sanitized
                 run.redactions = red.redactor.redactions
                 run.steps = red.logs
-                if !nano || !red.modelRan {
-                    if mode == .private { throw AppError("Apple Intelligence couldn't redact this trace, and Private mode never uses the cloud.") }
+                // Private mode: every later step is local too, so rules-only redaction is still safe; just continue.
+                if (!nano || !red.modelRan) && mode != .private {
                     // Only rules ran and the next step may be the cloud: let the user check first.
                     run.pending = nil
                     run.review = true

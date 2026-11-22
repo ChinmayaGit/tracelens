@@ -50,6 +50,13 @@ data class UiState(
     val crashes: List<CrashEntry>? = null,
     val crashesAllApps: Boolean = false,
     val showCrashes: Boolean = false,
+    /** Google AI Edge: an open model (Gemma/Qwen/Phi) downloaded to and run on this phone. */
+    val useEdge: Boolean = false,
+    val edgeModelId: String = "qwen2.5-1.5b",
+    val edgeInstalled: Set<String> = emptySet(),
+    val edgeProgress: Map<String, Float> = emptyMap(),
+    val hfToken: String = "",
+    val ramGb: Double = 0.0,
     val refreshing: Boolean = false,
 )
 
@@ -92,7 +99,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val device = deviceStatus()
             val saved = prefs.getString("mode", null)?.let { runCatching { ProcessingMode.valueOf(it) }.getOrNull() }
             val mode = when {
-                saved == ProcessingMode.PRIVATE && device != DeviceStatus.AVAILABLE -> ProcessingMode.HYBRID
+                // Private needs a local model: Gemini Nano, a downloaded AI Edge model, or a network server.
+                saved == ProcessingMode.PRIVATE && device != DeviceStatus.AVAILABLE &&
+                    !prefs.getBoolean("useEdge", false) && !prefs.getBoolean("useNetwork", false) -> ProcessingMode.HYBRID
                 saved != null -> saved
                 device == DeviceStatus.UNAVAILABLE -> ProcessingMode.CLOUD
                 else -> ProcessingMode.HYBRID
@@ -161,6 +170,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 useNetwork = prefs.getBoolean("useNetwork", false),
                 nano = runCatching { NanoOption.valueOf(prefs.getString("nano", "STABLE")!!) }.getOrDefault(NanoOption.STABLE),
+                useEdge = prefs.getBoolean("useEdge", false),
+                edgeModelId = prefs.getString("edgeModel", "qwen2.5-1.5b")!!,
+                hfToken = prefs.getString("hfToken", "")!!,
+                ramGb = Edge.deviceRamGb(getApplication()),
+                edgeInstalled = EDGE_MODELS.filter { m -> Edge.isInstalled(getApplication(), m) }.map { m -> m.id }.toSet(),
                 lan = LanConfig(
                     url = prefs.getString("lanUrl", LanConfig().url)!!,
                     model = prefs.getString("lanModel", "")!!,
@@ -174,9 +188,54 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun showSettings(show: Boolean) = _ui.update { it.copy(showSettings = show) }
 
     fun setUseNetwork(v: Boolean) {
-        prefs.edit().putBoolean("useNetwork", v).apply()
-        _ui.update { it.copy(useNetwork = v) }
+        prefs.edit().putBoolean("useNetwork", v).putBoolean("useEdge", false).apply()
+        _ui.update { it.copy(useNetwork = v, useEdge = false) }
         if (v) testLan()
+    }
+
+    fun setUseEdge(v: Boolean) {
+        prefs.edit().putBoolean("useEdge", v).putBoolean("useNetwork", false).apply()
+        _ui.update { it.copy(useEdge = v, useNetwork = false) }
+    }
+
+    fun setEdgeModel(id: String) {
+        prefs.edit().putString("edgeModel", id).apply()
+        _ui.update { it.copy(edgeModelId = id) }
+    }
+
+    fun setHfToken(t: String) {
+        prefs.edit().putString("hfToken", t).apply()
+        _ui.update { it.copy(hfToken = t) }
+    }
+
+    private val edgeJobs = HashMap<String, Job>()
+
+    fun downloadEdge(m: EdgeModel) {
+        if (edgeJobs[m.id]?.isActive == true) return
+        _ui.update { it.copy(edgeProgress = it.edgeProgress + (m.id to 0f), notice = null) }
+        edgeJobs[m.id] = viewModelScope.launch {
+            try {
+                Edge.download(getApplication(), m, _ui.value.hfToken) { p ->
+                    _ui.update { it.copy(edgeProgress = it.edgeProgress + (m.id to p)) }
+                }
+                _ui.update {
+                    it.copy(edgeInstalled = it.edgeInstalled + m.id, edgeProgress = it.edgeProgress - m.id,
+                        notice = "${m.name} downloaded. It now runs on this phone.")
+                }
+                setEdgeModel(m.id)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _ui.update { it.copy(edgeProgress = it.edgeProgress - m.id, notice = "Download paused. Tap Download to resume.") }
+            } catch (e: Exception) {
+                _ui.update { it.copy(edgeProgress = it.edgeProgress - m.id, notice = e.message) }
+            }
+        }
+    }
+
+    fun cancelEdgeDownload(m: EdgeModel) { edgeJobs[m.id]?.cancel() }
+
+    fun deleteEdge(m: EdgeModel) {
+        Edge.delete(getApplication(), m)
+        _ui.update { it.copy(edgeInstalled = it.edgeInstalled - m.id) }
     }
 
     fun setNano(o: NanoOption) {
@@ -210,6 +269,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun engine(): Engine {
         val s = _ui.value
+        if (s.useEdge) {
+            val m = EDGE_MODELS.firstOrNull { it.id == s.edgeModelId }
+            if (m != null && m.id in s.edgeInstalled) return Engine.OnPhone(m, getApplication())
+        }
         return if (s.useNetwork && s.lanStatus?.online == true && s.lan.model.isNotEmpty()) Engine.Network(s.lan)
         else Engine.Builtin(s.nano)
     }
@@ -278,27 +341,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { it.copy(device = dev) }
                 val mode = _ui.value.mode
                 val eng = engine()
+                if (_ui.value.useEdge && eng !is Engine.OnPhone && mode != ProcessingMode.CLOUD) {
+                    error("Download an on-device model in Settings (⚙ → On-device model), or switch to Cloud mode.")
+                }
                 if (_ui.value.useNetwork && eng !is Engine.Network && mode != ProcessingMode.CLOUD) {
                     error(
                         if (_ui.value.lanStatus?.online == false) "Your local network server (${_ui.value.lan.url}) is offline. Start it, switch to Built-in in Settings, or use Cloud mode."
                         else "Pick a model for your local network server in Settings.",
                     )
                 }
-                if (mode == ProcessingMode.PRIVATE && dev != DeviceStatus.AVAILABLE && eng !is Engine.Network) {
+                if (mode == ProcessingMode.PRIVATE && dev != DeviceStatus.AVAILABLE && eng is Engine.Builtin) {
                     error("Private mode needs Gemini Nano on this device. Switch to Hybrid or Cloud mode.")
                 }
                 require(raw.isNotEmpty()) { "Paste a stack trace or log first." }
                 require(looksLikeError(raw)) {
                     "That doesn't look like an error, stack trace or log. Paste the failing output (or try a sample)."
                 }
-                val nano = (dev == DeviceStatus.AVAILABLE || eng is Engine.Network) && mode != ProcessingMode.CLOUD
+                val nano = (dev == DeviceStatus.AVAILABLE || eng !is Engine.Builtin) && mode != ProcessingMode.CLOUD
                 setRun { it.copy(pending = if (nano) "Redacting on-device…" else "Redacting with local rules…") }
                 val red = redact(raw, dev, mode, _ui.value.config, eng)
                 redactor = red.redactor
                 setRun { it.copy(sanitized = red.sanitized, redactions = red.redactor.redactions, steps = red.logs) }
 
-                if (!nano || !red.modelRan) {
-                    if (mode == ProcessingMode.PRIVATE) error("Gemini Nano couldn't redact this trace, and Private mode never uses the cloud.")
+                // Private mode: every later step is local too, so rules-only redaction is still safe; just continue.
+                if ((!nano || !red.modelRan) && mode != ProcessingMode.PRIVATE) {
                     // Only rules ran and the next step may be the cloud: let the user check first.
                     setRun { it.copy(pending = null, review = true) }
                     return@launch
@@ -330,7 +396,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val s = _ui.value
             // Count cloud calls only; Gemini Nano is free and unmetered.
             val eng = engine()
-            val cloudPlanned = if (eng is Engine.Network && s.mode != ProcessingMode.CLOUD) false
+            val cloudPlanned = if (eng !is Engine.Builtin && s.mode != ProcessingMode.CLOUD) false
             else s.mode == ProcessingMode.CLOUD || s.device != DeviceStatus.AVAILABLE ||
                 run.sanitized.length > minOf(s.config.maxOnDeviceChars, 9_000)
             if (cloudPlanned) Quota.consume(uid)
@@ -358,7 +424,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun deepDiveNow() {
         val eng = engine()
-        val viaLan = eng is Engine.Network && _ui.value.mode == ProcessingMode.PRIVATE
+        // Private deep dives stay local: on the network server or the on-phone model.
+        val viaLan = eng !is Engine.Builtin && _ui.value.mode == ProcessingMode.PRIVATE
         if (_ui.value.mode == ProcessingMode.PRIVATE && !viaLan) {
             setRun { it.copy(error = "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a local network server for a private deep dive.") }
             return
@@ -366,7 +433,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val run = _ui.value.run
         setRun {
             it.copy(
-                pending = if (viaLan) "Deep dive on your network (${_ui.value.lan.model})…" else "Deep dive in the cloud (sanitized trace only)…",
+                pending = if (viaLan) (if (eng is Engine.OnPhone) "Deep dive on this phone (${eng.model.name})…" else "Deep dive on your network (${_ui.value.lan.model})…") else "Deep dive in the cloud (sanitized trace only)…",
                 analysis = "", error = null,
             )
         }
@@ -374,12 +441,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         try {
             if (!viaLan) _ui.value.uid?.let { Quota.consume(it) }
             var text = ""
-            deepDive(run.sanitized, run.triage, _ui.value.config, (eng as? Engine.Network)?.lan?.takeIf { viaLan }).collect { acc ->
+            deepDive(run.sanitized, run.triage, _ui.value.config,
+                (eng as? Engine.Network)?.lan?.takeIf { viaLan }, (eng as? Engine.OnPhone)?.takeIf { viaLan }).collect { acc ->
                 text = acc
                 setRun { it.copy(analysis = acc) }
             }
             val steps = run.steps.filter { it.step != "Root-cause deep dive" } +
-                StepLog("Root-cause deep dive", if (viaLan) StepSource.LOCAL_NETWORK else StepSource.IN_CLOUD, System.currentTimeMillis() - t)
+                StepLog("Root-cause deep dive", if (!viaLan) StepSource.IN_CLOUD else if (eng is Engine.OnPhone) StepSource.EDGE else StepSource.LOCAL_NETWORK, System.currentTimeMillis() - t)
             setRun { it.copy(steps = steps, pending = null) }
             val uid = _ui.value.uid
             val id = _ui.value.run.id

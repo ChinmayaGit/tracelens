@@ -38,6 +38,8 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Sideloadable APK: 64-bit ARM only (all current phones). The AAB is split per ABI by Play anyway.
+            ndk { abiFilters += "arm64-v8a" }
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
@@ -62,6 +64,8 @@ dependencies {
     implementation("com.google.firebase:firebase-firestore")
     implementation("com.google.firebase:firebase-config")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.11.0")
+    // Google AI Edge (same runtime as the AI Edge Gallery app): open models (Gemma, Qwen, Phi) on-device
+    implementation("com.google.mediapipe:tasks-genai:0.10.35")
 
     implementation(platform("androidx.compose:compose-bom:2026.11.01"))
     implementation("androidx.compose.ui:ui")

@@ -84,7 +84,7 @@ struct ContentView: View {
                     if model.run.review { ReviewCard(model: model) }
                     if let t = model.run.triage { triageCard(t) }
                     if !model.run.analysis.isEmpty {
-                        Card(title: "Root-cause analysis") { MarkdownView(markdown: model.run.analysis) }
+                        Card(title: "Root-cause analysis") { MarkdownView(markdown: model.run.analysis) }.id("analysis")
                     }
                     if !model.run.sanitized.isEmpty && !model.run.review { sanitizedCard }
                     historySection
@@ -95,7 +95,11 @@ struct ContentView: View {
             }
             // Bring results into view as soon as an analysis starts producing them.
             .onChange(of: model.run.steps.count) { _, n in
-                if n > 0 { withAnimation { proxy.scrollTo("results", anchor: .top) } }
+                if n > 0 && model.run.analysis.isEmpty { withAnimation { proxy.scrollTo("results", anchor: .top) } }
+            }
+            // Follow the deep dive as soon as it starts streaming.
+            .onChange(of: model.run.analysis.isEmpty) { _, empty in
+                if !empty { withAnimation { proxy.scrollTo("analysis", anchor: .top) } }
             }
             }
             .background(Color(.systemGroupedBackground))

@@ -34,6 +34,7 @@ enum class StepSource(val label: String) {
     IN_CLOUD("Cloud · Gemini"),
     LOCAL_RULES("Local rules"),
     LOCAL_NETWORK("Local network server"),
+    EDGE("On-device · AI Edge"),
     SKIPPED("Skipped"),
 }
 
@@ -48,6 +49,8 @@ enum class NanoOption(val label: String, val detail: String, val option: OnDevic
 sealed interface Engine {
     data class Builtin(val nano: NanoOption = NanoOption.STABLE) : Engine
     data class Network(val lan: LanConfig) : Engine
+    /** Open model (Gemma / Qwen / Phi) running on this phone via Google AI Edge. */
+    data class OnPhone(val model: EdgeModel, val ctx: android.content.Context) : Engine
 }
 
 data class StepLog(val step: String, val source: StepSource, val ms: Long, val note: String? = null)
@@ -222,8 +225,33 @@ private fun parseJson(text: String?): JSONObject {
     val start = t.indexOf('{')
     val end = t.lastIndexOf('}')
     require(start >= 0 && end > start) { "Model did not return JSON" }
-    return JSONObject(t.substring(start, end + 1))
+    val body = t.substring(start, end + 1)
+    return try {
+        JSONObject(body)
+    } catch (e: org.json.JSONException) {
+        // Small on-device models sometimes return the JSON escaped (\" and \n as text).
+        JSONObject(body.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", " "))
+    }
 }
+
+// Small open models (AI Edge) follow a concrete example far better than a schema description.
+private const val EDGE_SCRUB_PROMPT =
+    "Find sensitive data in this software log: people's names, usernames, internal hostnames, customer/order IDs, " +
+        "organisation names, addresses, phone numbers, secret values. Copy each one EXACTLY as it appears. " +
+        "Ignore anything already in [BRACKETS], package names, file names, line numbers.\n" +
+        "Answer with only JSON like this example:\n" +
+        "{\"items\":[{\"kind\":\"PERSON\",\"value\":\"Jane Doe\"},{\"kind\":\"CUSTOMER_ID\",\"value\":\"C-1029\"}]}\n" +
+        "If nothing is sensitive answer {\"items\":[]}\n\nLOG:\n"
+
+private const val EDGE_TRIAGE_PROMPT =
+    "You are a senior engineer. Triage this error log. Values like [EMAIL_1] are redacted placeholders.\n" +
+        "Answer with only JSON like this example:\n" +
+        // Deliberately unrelated to the samples so the model can't just copy it.
+        "{\"isError\":true,\"errorType\":\"ValueError\",\"language\":\"Python\"," +
+        "\"summary\":\"int() was given a non-numeric string.\",\"likelyCause\":\"form field 'age' contained 'abc'\"," +
+        "\"quickFix\":\"validate the field before calling int()\",\"severity\":\"medium\",\"confidence\":0.7}\n" +
+        "Do NOT copy the example: describe the actual error in the trace below.\n" +
+        "severity is one of low, medium, high, critical. confidence is between 0 and 1.\n\nTRACE:\n"
 
 /* ------------------------------------------------------------------ */
 /* Steps                                                                */
@@ -308,6 +336,25 @@ suspend fun redact(
             RedactResult(r, text, logs, modelRan = false)
         }
     }
+    if (engine is Engine.OnPhone && mode != ProcessingMode.CLOUD) {
+        t = System.currentTimeMillis()
+        return try {
+            val found = mutableListOf<Pair<String, String>>()
+            for (part in chunk(text, 3_000).take(4)) {
+                val items = parseJson(Edge.generate(engine.ctx, engine.model, EDGE_SCRUB_PROMPT + part)).optJSONArray("items")
+                for (i in 0 until (items?.length() ?: 0)) {
+                    val o = items!!.getJSONObject(i)
+                    found += o.optString("kind", "PII") to o.optString("value")
+                }
+            }
+            text = r.applyLiterals(text, found)
+            logs += StepLog("Redact context (AI)", StepSource.EDGE, System.currentTimeMillis() - t, engine.model.name)
+            RedactResult(r, text, logs, modelRan = true)
+        } catch (e: Exception) {
+            logs += StepLog("Redact context (AI)", StepSource.SKIPPED, System.currentTimeMillis() - t, "${e.message} Rule-based redaction only.")
+            RedactResult(r, text, logs, modelRan = false)
+        }
+    }
     val nano = (engine as? Engine.Builtin)?.nano ?: NanoOption.STABLE
     if (mode == ProcessingMode.CLOUD || device != DeviceStatus.AVAILABLE) {
         val why = if (mode == ProcessingMode.CLOUD) "Cloud mode" else "Gemini Nano not available"
@@ -360,6 +407,11 @@ suspend fun triage(
         val tri = parseTriage(parseJson(Lan.chat(engine.lan, LAN_SYSTEM, TRIAGE_PROMPT + sanitized, LAN_TRIAGE_SCHEMA)))
         return tri to StepLog("Quick triage", StepSource.LOCAL_NETWORK, System.currentTimeMillis() - t0, engine.lan.model)
     }
+    if (engine is Engine.OnPhone && mode != ProcessingMode.CLOUD && sanitized.length <= 9_000) {
+        val t0 = System.currentTimeMillis()
+        val tri = parseTriage(parseJson(Edge.generate(engine.ctx, engine.model, EDGE_TRIAGE_PROMPT + sanitized)))
+        return tri to StepLog("Quick triage", StepSource.EDGE, System.currentTimeMillis() - t0, engine.model.name)
+    }
     val nano = (engine as? Engine.Builtin)?.nano ?: NanoOption.STABLE
     val limit = minOf(cfg.maxOnDeviceChars, ANDROID_ON_DEVICE_MAX_CHARS)
     val tooLong = sanitized.length > limit
@@ -384,7 +436,7 @@ suspend fun triage(
 }
 
 /** Cloud only, sanitized text only. Emits accumulated Markdown. */
-fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig, lan: LanConfig? = null): Flow<String> {
+fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig, lan: LanConfig? = null, phone: Engine.OnPhone? = null): Flow<String> {
     val prompt = buildString {
         append(DEEP_PROMPT)
         if (tri != null) {
@@ -394,6 +446,7 @@ fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig, lan: LanConfig
     }
     // Private deep dive on your own network's bigger model.
     if (lan != null) return Lan.stream(lan, "You are a principal engineer.", prompt)
+    if (phone != null) return Edge.stream(phone.ctx, phone.model, prompt)
     val sb = StringBuilder()
     return deepModel(cfg).generateContentStream(prompt).map { chunk ->
         sb.append(chunk.text.orEmpty())

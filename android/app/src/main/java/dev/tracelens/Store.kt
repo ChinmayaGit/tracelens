@@ -68,7 +68,8 @@ object Store {
     // Web stores step ids like "triage" and sources like "on_device"; keep the formats compatible.
     private fun StepLog.toMap() = buildMap {
         put("step", STEP_IDS[step] ?: step)
-        put("source", source.name.lowercase())
+        // AI Edge steps count as on-device for stats (web understands on_device); the model is in the note.
+        put("source", if (source == StepSource.EDGE) "on_device" else source.name.lowercase())
         put("ms", ms)
         note?.let { put("note", it) }
     }
