@@ -24,7 +24,9 @@ if (env.VITE_APPCHECK_DEBUG_TOKEN) {
 }
 initializeAppCheck(app, {
   provider: new ReCaptchaEnterpriseProvider(env.VITE_RECAPTCHA_ENTERPRISE_KEY),
-  isTokenAutoRefreshEnabled: true,
+  // Don't fetch a token on page load: each token exchange is a billable
+  // reCAPTCHA assessment. A token is fetched only when an AI call needs one.
+  isTokenAutoRefreshEnabled: false,
 });
 
 export const ai = getAI(app, { backend: new GoogleAIBackend() });

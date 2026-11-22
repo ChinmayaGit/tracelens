@@ -6,10 +6,62 @@ service cloud.firestore {
       allow read, delete: if request.auth != null && request.auth.uid == uid;
       allow create, update: if request.auth != null && request.auth.uid == uid
         && request.resource.data.keys().hasOnly(
-             ['title', 'sanitized', 'triage', 'analysis', 'steps', 'redactionCounts', 'redactionTotal', 'createdAt'])
+             ['title', 'sanitized', 'triage', 'analysis', 'steps', 'redactionCounts', 'redactionTotal', 'platform', 'createdAt'])
         && request.resource.data.sanitized is string
         && request.resource.data.sanitized.size() <= 40000;
     }
+
+    // ---------------------------------------------------------------
+    // Rate limiting for cloud AI calls (on-device Gemini Nano is free
+    // and not counted). Every cloud call must first bump BOTH counters
+    // in one batch/transaction. The day is derived from the server
+    // clock, so clients can't reset their counters early.
+    //   per user : 30 cloud calls / day
+    //   global   : 300 cloud calls / day  (~9k/month, under the 10k
+    //              free reCAPTCHA assessments)
+    // Keep in sync with web/src/lib/quota.ts and android Quota.kt.
+    // ---------------------------------------------------------------
+    function today() {
+      return int(request.time.toMillis() / 86400000);
+    }
+
+    // New counter value must be exactly +1 for today (or 1 on a new day).
+    function validBump(limit) {
+      let n = request.resource.data;
+      let fresh = resource == null || resource.data.day != today();
+      return n.keys().hasOnly(['day', 'count'])
+        && n.day == today()
+        && n.count == (fresh ? 1 : resource.data.count + 1)
+        && n.count <= limit;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/usage/$(request.auth.uid);
+    }
+    function globalPath() {
+      return /databases/$(database)/documents/usage/_global;
+    }
+
+    match /usage/{id} {
+      allow read: if request.auth != null && (id == request.auth.uid || id == '_global');
+
+      // A user's own counter: only together with a global bump.
+      allow create, update: if request.auth != null && id == request.auth.uid
+        && validBump(30)
+        && getAfter(globalPath()).data.day == today()
+        && getAfter(globalPath()).data.count == (
+             !exists(globalPath()) || get(globalPath()).data.day != today()
+               ? 1 : get(globalPath()).data.count + 1);
+
+      // The global counter: only together with this user's bump.
+      allow create, update: if request.auth != null && id == '_global'
+        && validBump(300)
+        && getAfter(userPath()).data.day == today()
+        && getAfter(userPath()).data.count == (
+             !exists(userPath()) || get(userPath()).data.day != today()
+               ? 1 : get(userPath()).data.count + 1);
+    }
+
     match /{document=**} { allow read, write: if false; }
   }
 }

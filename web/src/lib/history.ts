@@ -24,6 +24,8 @@ export interface TraceDoc {
   steps: StepLog[];
   redactionCounts: Record<string, number>;
   redactionTotal: number;
+  /** "web" | "android" */
+  platform?: string;
   createdAt: Timestamp | null;
 }
 
@@ -37,6 +39,7 @@ export async function saveTrace(
   const ref = await addDoc(col(uid), {
     ...data,
     sanitized: data.sanitized.slice(0, MAX_STORED),
+    platform: "web",
     createdAt: serverTimestamp(),
   });
   return ref.id;

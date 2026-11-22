@@ -32,6 +32,17 @@ Not every machine can run Gemini Nano (Chrome needs 22 GB free disk, plus a GPU 
 
 The model download is opt-in. The app shows the requirements first, warns if no progress arrives within 30 s (usually low disk space), and can be cancelled. It stops itself after 2 minutes of no progress and switches to Cloud mode.
 
+## Abuse protection and cost caps
+
+Cloud calls are rate-limited by **Firestore security rules**, so the limits hold even if someone modifies the client:
+
+- **30 cloud AI calls per user per day** and **300 per day for the whole app**. That keeps reCAPTCHA Enterprise under its free 10k assessments/month.
+- Before every cloud call, the client must bump its own counter and the global counter in a single transaction. The rules check that the day comes from the server clock, that each counter goes up by exactly +1, and that the limits aren't exceeded. Rule tests cover skipping ahead, resetting to yesterday, bumping only one counter, writing someone else's counter and the 31st call: all are rejected.
+- **On-device Gemini Nano calls are free and never counted**, so privacy-first users are unlimited.
+- App Check fetches tokens lazily (`isTokenAutoRefreshEnabled: false`), so page visits that don't use AI cost no reCAPTCHA assessment.
+
+Code: [firestore.rules](firestore.rules), [web/src/lib/quota.ts](web/src/lib/quota.ts), [Quota.kt](android/app/src/main/java/dev/tracelens/Quota.kt).
+
 ## How it works
 
 ```
@@ -94,8 +105,32 @@ firebase deploy --only hosting,firestore:rules,remoteconfig
 
 ## Platforms
 
-- **Web (Chrome):** this repo, [web/](web/)
-- **Android:** in progress. A Kotlin app with the same pipeline on Gemini Nano through `firebase-ai-ondevice`, sharing the Firebase project, Auth and Firestore history.
+Both apps share one Firebase project, the same Firestore layout (`users/{uid}/traces`, tagged `platform: web | android`) and the same Remote Config routing knobs.
+
+### Web (Chrome): [web/](web/)
+Gemini Nano through Chrome's Prompt API. See *Run it* above.
+
+### Android (Kotlin, Jetpack Compose): [android/](android/)
+Gemini Nano through ML Kit's Prompt API (AICore) via `firebase-ai-ondevice`. Key code: [Pipeline.kt](android/app/src/main/java/dev/tracelens/Pipeline.kt).
+
+| Step | Android API |
+|---|---|
+| Model status / download | `FirebaseAIOnDevice.checkStatus()` / `FirebaseAIOnDevice.download()` |
+| Contextual redaction | `OnDeviceConfig(mode = InferenceMode.ONLY_ON_DEVICE)` |
+| Triage | `PREFER_ON_DEVICE` / `ONLY_ON_DEVICE` / `ONLY_IN_CLOUD` by processing mode, JSON `responseSchema` |
+| Deep dive | `ONLY_IN_CLOUD` + `generateContentStream` |
+| Which backend answered | `response.inferenceSource` |
+
+Android-only extras:
+- **Share to TraceLens:** share a crash log or logcat text from any app straight into the input.
+- **Review before cloud:** on phones without AICore, long-press and select any text in the sanitized trace to hide it before anything is sent.
+
+Build and run:
+1. In the Firebase console, add an Android app with package `dev.tracelens` and put its `google-services.json` in `android/app/`. It is git-ignored.
+2. Run `cd android && ./gradlew installDebug` (JDK 17, Android SDK 37.2).
+3. On first launch, logcat prints an App Check debug token. Register it with `firebase appcheck:debugtokens:create <token> --app <android app id>`.
+
+Gemini Nano runs on AICore devices (e.g. Pixel 9+, Galaxy S24+). Other phones fall back to the cloud automatically, with the review step.
 
 ## License
 

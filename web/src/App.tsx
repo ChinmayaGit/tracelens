@@ -29,6 +29,7 @@ import type { Redaction, Redactor } from "./lib/redact";
 import { deleteTrace, saveTrace, updateTrace, watchHistory, type TraceDoc } from "./lib/history";
 import { Confidence, Markdown, RedactionList, Sanitized, Timeline } from "./components/bits";
 import { DeviceSetup } from "./components/DeviceSetup";
+import { consumeCloudQuota, watchRemaining, USER_DAILY_LIMIT } from "./lib/quota";
 import { SAMPLES } from "./samples";
 
 interface Run {
@@ -138,11 +139,44 @@ export default function App() {
     });
     return onAuthStateChanged(auth, (u) => {
       if (u) setUser(u);
-      else signInAnonymously(auth).catch((e) => patch({ error: `Sign-in failed: ${e.message}` }));
+      else
+        signInAnonymously(auth).catch(() =>
+          patch({
+            error: navigator.onLine
+              ? "Couldn't connect to Firebase. Tap Retry."
+              : "You're offline. Connect to the internet, then tap Retry.",
+          }),
+        );
     });
   }, []);
 
+  /* ---------- reconnect (Retry button + automatic when back online) ---------- */
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      setDevice(await deviceStatus());
+      setCfg(await loadRoutingConfig());
+      if (!auth.currentUser) await signInAnonymously(auth);
+      setRun((r) => (r.pending ? r : { ...r, error: null }));
+    } catch {
+      patch({
+        error: navigator.onLine
+          ? "Still can't reach Firebase. Try again in a moment."
+          : "You're offline. Connect to the internet, then tap Retry.",
+      });
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
+  useEffect(() => {
+    addEventListener("online", refresh);
+    return () => removeEventListener("online", refresh);
+  }, [refresh]);
+
   useEffect(() => (user ? watchHistory(user.uid, setHistory) : undefined), [user]);
+  const [cloudLeft, setCloudLeft] = useState(USER_DAILY_LIMIT);
+  useEffect(() => (user ? watchRemaining(user.uid, setCloudLeft) : undefined), [user]);
 
   /* ---------- pipeline ---------- */
   const doDeepDive = useCallback(
@@ -158,6 +192,7 @@ export default function App() {
       patch({ pending: "Deep dive in the cloud (sanitized trace only)…", analysis: "", error: null });
       let text = "";
       try {
+        if (user) await consumeCloudQuota(user.uid);
         const gen = deepDive(base.sanitized, base.triage, cfg);
         let r = await gen.next();
         while (!r.done) {
@@ -202,6 +237,7 @@ export default function App() {
           );
         }
         step({ pending: "Reading screenshot…" });
+        if (!nano) await consumeCloudQuota(user.uid);
         const { text, log } = await extractFromImage(image, nano ? false : cloudOk);
         raw = [raw, text].filter(Boolean).join("\n\n");
         setInput(raw);
@@ -244,7 +280,12 @@ export default function App() {
     };
     try {
       step({ pending: "Triaging…" });
+      // Count cloud calls only; Gemini Nano is free and unmetered.
+      const cloudPlanned = mode === "cloud" || device !== "available" || r.sanitized.length > cfg.maxOnDeviceChars;
+      if (cloudPlanned) await consumeCloudQuota(user.uid);
       const tri = await runTriage(r.sanitized, cfg, mode);
+      // Hybrid can still fall back to the cloud if Nano fails: count it afterwards.
+      if (!cloudPlanned && tri.log.source === "in_cloud") await consumeCloudQuota(user.uid).catch(() => {});
       step({ steps: [...r.steps, tri.log], pending: null });
       if (tri.triage.isError === false) {
         throw new Error("The model didn't find an error in this input, so nothing was saved. Paste the full failing output.");
@@ -383,7 +424,7 @@ export default function App() {
                   <span className={`sev sev-${d.triage?.severity ?? "low"}`} />
                   <span className="h-title">{d.title}</span>
                   <span className="h-meta">
-                    {d.redactionTotal} redacted · {d.createdAt?.toDate().toLocaleDateString() ?? "pending sync"}
+                    {d.redactionTotal} redacted · {d.platform ?? "web"} · {d.createdAt?.toDate().toLocaleDateString() ?? "pending sync"}
                   </span>
                 </button>
                 <button className="x" aria-label="Delete" onClick={() => user && deleteTrace(user.uid, d.id)}>
@@ -435,13 +476,23 @@ export default function App() {
                   </label>
                 )}
               </div>
+              <span className="quota" title="Cloud AI calls are rate-limited; on-device Gemini Nano is unlimited">
+                {cloudLeft}/{USER_DAILY_LIMIT} cloud runs left today
+              </span>
               <button className="primary" onClick={analyze} disabled={busy || !user || (!input.trim() && !image)}>
                 {busy ? "Working…" : "Analyze privately"}
               </button>
             </div>
           </section>
 
-          {run.error && <div className="error">{run.error}</div>}
+          {run.error && (
+            <div className="error row between">
+              <span>{run.error}</span>
+              <button className="retry" onClick={refresh} disabled={refreshing}>
+                {refreshing ? "Retrying…" : "↻ Retry"}
+              </button>
+            </div>
+          )}
 
           {(run.steps.length > 0 || run.pending) && (
             <section className="card">
