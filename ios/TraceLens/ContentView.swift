@@ -394,6 +394,7 @@ struct RedactionList: View {
                     switch r.by {
                     case "rule": Badge(text: "rule", color: rulesPurple)
                     case "user": Badge(text: "you", color: warn)
+                    case "network": Badge(text: "network model", color: Color(red: 0.05, green: 0.45, blue: 0.56))
                     default: Badge(text: "Apple Intelligence", color: deviceGreen)
                     }
                 }

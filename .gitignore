@@ -21,3 +21,4 @@ android/keystore.properties
 android/*.jks
 android/app/*.jks
 release/
+pics/

@@ -533,6 +533,8 @@ private fun RedactionList(items: List<Redaction>) {
                 val (l, c) = when (r.by) {
                     "rule" -> "rule" to RulesPurple
                     "user" -> "you" to Warn
+                    "network" -> "network model" to Color(0xFF0E7490)
+                    "edge" -> "AI Edge model" to DeviceGreen
                     else -> "Gemini Nano" to DeviceGreen
                 }
                 Badge(l, c)

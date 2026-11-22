@@ -9,16 +9,16 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 **Live demo:** https://tracelens-e8e9a.web.app (desktop Chrome recommended)
 
 <p align="center">
-  <img src="docs/screenshots/web-home.png" width="820" alt="Web">
+  <img src="docs/screenshots/web-home.jpg" width="820" alt="Web">
 </p>
-<p align="center"><sub>Web (Chrome + Gemini Nano)</sub></p>
+<p align="center"><sub>Web: Chrome with Gemini Nano ready, every AI step on-device</sub></p>
 
 <p align="center">
   <img src="docs/screenshots/android-home.jpg" width="260" alt="Android">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/screenshots/ios-home.png" width="260" alt="iOS">
+  <img src="docs/screenshots/ios-home.jpg" width="260" alt="iOS">
 </p>
-<p align="center"><sub>Android (Qwen 2.5 on the phone) &nbsp;·&nbsp; iOS</sub></p>
+<p align="center"><sub>Android: Private mode on Qwen 2.5 (on the phone) &nbsp;·&nbsp; iOS: Private mode on a network model</sub></p>
 
 ### Local AI on every platform
 
@@ -30,8 +30,8 @@ Private mode keeps every AI step off the cloud. Real runs: **Web** in Chrome on 
 
 | Android · Qwen 2.5 **on the phone** | Android · Llama 3.2 **on a network server** | iOS · Llama 3.2 **on a network server** | iOS · private deep dive |
 |:---:|:---:|:---:|:---:|
-| <img src="docs/screenshots/android-pipeline.jpg" width="200" alt="Android on-phone pipeline"> | <img src="docs/screenshots/android-lan-pipeline.jpg" width="200" alt="Android network pipeline"> | <img src="docs/screenshots/ios-local-network.png" width="200" alt="iOS network pipeline"> | <img src="docs/screenshots/ios-lan-deepdive.jpg" width="200" alt="iOS deep dive"> |
-| redaction ~18 s · triage ~9 s | redaction 9.4 s · triage 4.3 s | redaction 9 s · triage 6.6 s | root cause + code fix |
+| <img src="docs/screenshots/android-pipeline.jpg" width="200" alt="Android on-phone pipeline"> | <img src="docs/screenshots/android-lan-pipeline.jpg" width="200" alt="Android network pipeline"> | <img src="docs/screenshots/ios-local-network.jpg" width="200" alt="iOS network pipeline"> | <img src="docs/screenshots/ios-lan-deepdive.jpg" width="200" alt="iOS deep dive"> |
+| redaction ~18 s · triage ~9 s | redaction 9.4 s · triage 4.3 s · deep dive 21.8 s | redaction 14.2 s · triage 5.9 s · deep dive 26.3 s | root cause + code fix |
 
 *On a real iPhone 15 Pro or newer, iOS uses Apple Intelligence on-device; the Simulator can't run Apple's model, so the iOS shots use the network server.*
 
@@ -93,13 +93,13 @@ Private mode keeps every AI step off the cloud. Real runs: **Web** in Chrome on 
 3. When no local model ran, the **Review** card lets you **select any text and press Hide**. It becomes `[HIDDEN_1]` everywhere.
 4. Placeholders are stable (the same secret always gets the same placeholder), so the AI can still reason about the trace. The originals stay in memory on your device and are **never stored** in Firestore.
 
-| Review & hide (web) | Result (web) |
+| Review & hide before the cloud (web) | Cloud result with sanitized input (web) |
 |:---:|:---:|
-| <img src="docs/screenshots/web-review.png" width="420" alt="Review"> | <img src="docs/screenshots/web-result.png" width="420" alt="Result"> |
+| <img src="docs/screenshots/web-review.jpg" width="420" alt="Review and hide"> | <img src="docs/screenshots/web-result.png" width="420" alt="Result"> |
 
-| Android: triage | Android: redacted trace | Android: crash import |
-|:---:|:---:|:---:|
-| <img src="docs/screenshots/android-triage.jpg" width="200" alt="Triage"> | <img src="docs/screenshots/android-redacted.jpg" width="200" alt="Redacted trace"> | <img src="docs/screenshots/android-crashes.jpg" width="200" alt="Crash import"> |
+| Android: Cloud mode (no local model) | Android: on-device triage | Android: redacted trace, kept on device | Android: sanitized trace + history |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/screenshots/android-cloud.jpg" width="200" alt="Cloud mode pipeline"> | <img src="docs/screenshots/android-triage.jpg" width="200" alt="Triage"> | <img src="docs/screenshots/android-redacted.jpg" width="200" alt="Redacted trace"> | <img src="docs/screenshots/android-private-trace.jpg" width="200" alt="Sanitized trace and history"> |
 
 ---
 
@@ -164,7 +164,9 @@ OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve # listen on the network, allow
 - **Android:** cleartext HTTP is allowed so it can reach the server (Firebase traffic stays HTTPS).
 - **iOS:** asks for **Local Network** permission the first time.
 
-<p><img src="docs/screenshots/ios-settings-lan.jpg" width="200" alt="iOS local server settings"></p>
+| iOS: server online + model | iOS: memory saver + recommended models |
+|:---:|:---:|
+| <img src="docs/screenshots/ios-settings-lan.jpg" width="200" alt="iOS local server settings"> | <img src="docs/screenshots/ios-settings-models.jpg" width="200" alt="iOS recommended models"> |
 
 **Android:** besides network models, ⚙ Settings lets you pick the Gemini Nano build: **Stable** (default), **Fast** (smaller, `PREVIEW_FAST`) or **Latest** (larger, `PREVIEW`). The preview builds need the AICore developer preview.
 
@@ -187,9 +189,9 @@ Gemini Nano isn't everywhere, and on low-end machines it can be very slow (8 min
 
 Requires WebGPU: Chrome / Edge 121+ or Safari 26+. Measured on an 8 GB M1 MacBook Pro with Gemma 4 E2B: first load ~40 s, then redaction ~7 s, triage ~4 s, deep dive ~14 s.
 
-| Browser models tab | Network server tab | Gemini Nano tab |
+| Gemini Nano tab (✓ in use, model ready) | Browser models tab | Network server tab |
 |:---:|:---:|:---:|
-| <img src="docs/screenshots/web-settings-browser.jpg" width="270" alt="Browser models tab"> | <img src="docs/screenshots/web-settings-network.jpg" width="270" alt="Network server tab"> | <img src="docs/screenshots/web-settings-nano.jpg" width="270" alt="Gemini Nano tab"> |
+| <img src="docs/screenshots/web-settings-nano.jpg" width="270" alt="Gemini Nano tab"> | <img src="docs/screenshots/web-settings-browser.jpg" width="270" alt="Browser models tab"> | <img src="docs/screenshots/web-settings-network.jpg" width="270" alt="Network server tab"> |
 
 ### Android: models on the phone
 
@@ -212,9 +214,9 @@ Most phones don't have Gemini Nano (it needs AICore: Pixel 9+, Galaxy S24+ and s
 - **Quality note:** 1–2B models give useful triage but can invent details (e.g. a database name). Use **Hybrid** for a cloud deep dive, or a bigger model (Gemma 3n, or a [network server](#bigger-models-on-your-local-network)), when it matters.
 - *Why not Firebase AI Logic here?* AI Logic's on-device path is Gemini Nano. AI Edge is an extra local engine for phones without Nano. Cloud calls still go through Firebase AI Logic with App Check.
 
-| Model picker | Private mode on Qwen 2.5 | Network server (Android) | Private deep dive on the network |
+| Choose the engine | Model picker | Private mode on Qwen 2.5 | Private deep dive (network model) |
 |:---:|:---:|:---:|:---:|
-| <img src="docs/screenshots/android-edge-models.jpg" width="200" alt="Model picker"> | <img src="docs/screenshots/android-home.jpg" width="200" alt="Private on Qwen"> | <img src="docs/screenshots/android-lan-home.jpg" width="200" alt="LAN online"> | <img src="docs/screenshots/android-lan-deepdive.jpg" width="200" alt="Network deep dive"> |
+| <img src="docs/screenshots/android-settings.jpg" width="200" alt="Engine settings"> | <img src="docs/screenshots/android-edge-models.jpg" width="200" alt="Model picker"> | <img src="docs/screenshots/android-home.jpg" width="200" alt="Private on Qwen"> | <img src="docs/screenshots/android-lan-deepdive.jpg" width="200" alt="Network deep dive"> |
 
 ---
 
@@ -227,6 +229,8 @@ adb shell pm grant dev.tracelens android.permission.READ_LOGS
 Without the grant you only see TraceLens's own crashes; the app shows the command with a Copy button. You can also **share** any crash text to TraceLens from another app.
 
 > **Realme / OPPO / OnePlus:** the grant fails with `SecurityException … GRANT_RUNTIME_PERMISSIONS` until you enable **Developer options → Disable permission monitoring**. **Xiaomi:** enable **USB debugging (Security settings)**.
+
+<p><img src="docs/screenshots/android-crashes.jpg" width="200" alt="Android crash import sheet"></p>
 
 **iOS:** Apple's sandbox doesn't let apps read other apps' crash logs. Export a crash from **Settings → Privacy & Security → Analytics Data** (or Xcode → Devices), then tap 🐞 to import the `.ips` / `.crash` / `.log` file.
 

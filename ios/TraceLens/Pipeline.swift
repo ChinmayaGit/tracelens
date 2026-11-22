@@ -221,7 +221,7 @@ enum Pipeline {
                         found.append((kind: item["kind"] as? String ?? "PII", value: item["value"] as? String ?? ""))
                     }
                 }
-                text = r.applyLiterals(text, found)
+                text = r.applyLiterals(text, found, by: "network")
                 logs.append(StepLog(step: "redact_model", source: .localNetwork, ms: ms(since: t), note: lan.model))
                 return RedactResult(redactor: r, sanitized: text, logs: logs, modelRan: true)
             } catch {

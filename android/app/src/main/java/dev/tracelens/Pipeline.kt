@@ -328,7 +328,7 @@ suspend fun redact(
                     found += o.optString("kind", "PII") to o.optString("value")
                 }
             }
-            text = r.applyLiterals(text, found)
+            text = r.applyLiterals(text, found, by = "network")
             logs += StepLog("Redact context (AI)", StepSource.LOCAL_NETWORK, System.currentTimeMillis() - t, engine.lan.model)
             RedactResult(r, text, logs, modelRan = true)
         } catch (e: Exception) {
@@ -347,7 +347,7 @@ suspend fun redact(
                     found += o.optString("kind", "PII") to o.optString("value")
                 }
             }
-            text = r.applyLiterals(text, found)
+            text = r.applyLiterals(text, found, by = "edge")
             logs += StepLog("Redact context (AI)", StepSource.EDGE, System.currentTimeMillis() - t, engine.model.name)
             RedactResult(r, text, logs, modelRan = true)
         } catch (e: Exception) {

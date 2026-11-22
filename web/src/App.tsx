@@ -561,9 +561,6 @@ export default function App() {
             </span>
           )}
           <span className={`pill ${online ? "pill-online" : "pill-offline"}`}>{online ? "Online" : "Offline"}</span>
-          <button className={`ghost ${inSettings ? "active" : ""}`} onClick={() => (inSettings ? closeSettings() : openSettings())} aria-label="Settings and setup">
-            ⚙ Settings
-          </button>
           {user?.isAnonymous ? (
             <button className="ghost" onClick={googleSignIn}>
               Sign in to sync
@@ -573,6 +570,9 @@ export default function App() {
               Sign out
             </button>
           ) : null}
+          <button className={`ghost ${inSettings ? "active" : ""}`} onClick={() => (inSettings ? closeSettings() : openSettings())} aria-label="Settings and setup">
+            ⚙ Settings
+          </button>
         </div>
       </header>
 
