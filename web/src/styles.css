@@ -146,3 +146,45 @@ mark { background: var(--mark); color: var(--mark-ink); border-radius: 4px; padd
 .dot-bad { background: #fde1e1; color: var(--bad); }
 .dot-wait { background: var(--code); color: var(--muted); }
 details summary { cursor: pointer; }
+.badge-edge { background: var(--device-bg); color: var(--device); }
+.models { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 12px; }
+.model { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.model.on { border-color: var(--brand); }
+.model .radio { margin: 0; }
+.grow { flex: 1; }
+
+/* ---------- settings page with tabs ---------- */
+.settings-page { max-width: 980px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.settings-top { display: flex; gap: 14px; align-items: flex-start; }
+.settings-top h2 { font-size: 20px; margin: 2px 0 4px; }
+.tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; border-bottom: 1px solid var(--line); }
+.tab { display: flex; gap: 10px; align-items: center; text-align: left; border: 1px solid transparent; border-bottom: none;
+  border-radius: 10px 10px 0 0; background: transparent; padding: 10px 12px; color: var(--muted); }
+.tab:hover { background: var(--code); }
+.tab.on { background: var(--panel); border-color: var(--line); color: var(--ink); position: relative; top: 1px; box-shadow: inset 0 2px 0 var(--brand); }
+.tab-icon { font-size: 18px; width: 28px; height: 28px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; background: var(--code); flex-shrink: 0; }
+.tab.on .tab-icon { background: var(--brand); color: var(--brand-ink); }
+.tab-text { display: flex; flex-direction: column; min-width: 0; }
+.tab-text b { font-size: 14px; display: flex; align-items: center; gap: 6px; }
+.tab-text small { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--device); display: inline-block; }
+.tab-body { background: var(--panel); border: 1px solid var(--line); border-top: none; border-radius: 0 0 var(--radius) var(--radius);
+  padding: 18px; display: flex; flex-direction: column; gap: 14px; margin-top: -16px; }
+.engine-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.engine-head h3 { margin: 0 0 4px; font-size: 16px; }
+.engine-head p { margin: 0; max-width: 640px; }
+.panel { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.panel h4 { margin: 0; font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
+.reqs-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+@media (max-width: 680px) {
+  .settings-page { padding: 16px; }
+  .tabs { grid-template-columns: 1fr; border-bottom: none; }
+  .tab { border-radius: 10px; border-color: var(--line); border-bottom: 1px solid var(--line); }
+  .tab.on { top: 0; }
+  .tab-body { margin-top: 0; border-top: 1px solid var(--line); border-radius: var(--radius); }
+}
+button.link { border: 0; background: none; padding: 0; color: var(--brand); font-weight: 600; text-decoration: underline; }
+button.ghost.active { border-color: var(--brand); color: var(--brand); }
+/* the settings page replaces the main screen */
+.layout[hidden] { display: none; }
+.model > button { align-self: flex-start; }

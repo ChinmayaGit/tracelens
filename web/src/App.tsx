@@ -29,8 +29,9 @@ import type { Redaction, Redactor } from "./lib/redact";
 import { deleteTrace, saveTrace, updateTrace, watchHistory, type TraceDoc } from "./lib/history";
 import { Confidence, Markdown, RedactionList, Sanitized, Timeline } from "./components/bits";
 import { DeviceSetup } from "./components/DeviceSetup";
-import { Settings, type EngineKind } from "./components/Settings";
+import { SettingsPage, tabForEngine, type EngineKind, type SettingsTab } from "./components/SettingsPage";
 import { DEFAULT_LAN, lanStatus, type LanConfig, type LanStatus } from "./lib/local";
+import { BROWSER_MODELS, deleteModel, downloadModel, installedModels } from "./lib/edge";
 import type { Engine } from "./lib/pipeline";
 
 /** Per-browser preferences (best effort; the app works without storage). */
@@ -198,10 +199,32 @@ export default function App() {
   const [cloudLeft, setCloudLeft] = useState(USER_DAILY_LIMIT);
 
   /* ---------- local engine: built-in Nano (default) or a LAN server ---------- */
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Settings is its own page with tabs: #/settings/<nano|browser|network>
+  const [hash, setHash] = useState(() => location.hash);
+  useEffect(() => {
+    const on = () => setHash(location.hash);
+    addEventListener("hashchange", on);
+    return () => removeEventListener("hashchange", on);
+  }, []);
+  const settingsTab = hash.match(/^#\/settings\/(nano|browser|network)/)?.[1] as SettingsTab | undefined;
+  const inSettings = hash.startsWith("#/settings");
   const [engineKind, setEngineKindState] = useState<EngineKind>(() => loadPref("tracelens.engine", "builtin"));
   const [lan, setLanState] = useState<LanConfig>(() => loadPref("tracelens.lan", DEFAULT_LAN));
   const [lanInfo, setLanInfo] = useState<LanStatus | null>(null);
+  // True when Settings was opened from the main screen, so ← Back can pop that entry.
+  const openedFromApp = useRef(false);
+  const openSettings = (tab?: SettingsTab) => {
+    openedFromApp.current = true;
+    location.hash = `#/settings/${tab ?? tabForEngine(engineKind)}`;
+  };
+  const closeSettings = () => {
+    if (openedFromApp.current) {
+      openedFromApp.current = false;
+      window.history.back();
+    } else {
+      location.hash = ""; // deep-linked straight to settings
+    }
+  };
   const setEngineKind = (e: EngineKind) => {
     setEngineKindState(e);
     savePref("tracelens.engine", e);
@@ -223,15 +246,80 @@ export default function App() {
     };
   }, [engineKind, lan.url]);
   const lanReady = engineKind === "lan" && !!lanInfo?.online && !!lan.model;
-  const engine: Engine = lanReady ? { kind: "lan", lan } : { kind: "builtin" };
+
+  /* ---------- open models in this browser (Google AI Edge / WebGPU) ---------- */
+  const [browserModelId, setBrowserModelIdState] = useState<string>(() => loadPref("tracelens.browserModel", "gemma4-e2b"));
+  const [browserInstalled, setBrowserInstalled] = useState<Set<string>>(new Set());
+  const [browserProgress, setBrowserProgress] = useState<Record<string, number>>({});
+  const [browserNotice, setBrowserNotice] = useState<string | null>(null);
+  const [hfToken, setHfTokenState] = useState<string>(() => loadPref("tracelens.hfToken", ""));
+  const downloads = useRef<Record<string, AbortController>>({});
+  useEffect(() => {
+    installedModels().then(setBrowserInstalled);
+  }, []);
+  const setBrowserModelId = (id: string) => {
+    setBrowserModelIdState(id);
+    savePref("tracelens.browserModel", id);
+  };
+  const browserModel = BROWSER_MODELS.find((m) => m.id === browserModelId);
+  const browserReady = engineKind === "browser" && !!browserModel && browserInstalled.has(browserModel.id);
+  const browserProps = {
+    selected: browserModelId,
+    select: setBrowserModelId,
+    installed: browserInstalled,
+    progress: browserProgress,
+    hfToken,
+    setHfToken: (t: string) => {
+      setHfTokenState(t);
+      savePref("tracelens.hfToken", t);
+    },
+    notice: browserNotice,
+    download: async (id: string) => {
+      const m = BROWSER_MODELS.find((x) => x.id === id);
+      if (!m || downloads.current[id]) return;
+      const ac = new AbortController();
+      downloads.current[id] = ac;
+      setBrowserNotice(null);
+      setBrowserProgress((p) => ({ ...p, [id]: 0 }));
+      try {
+        await downloadModel(m, hfToken, (v) => setBrowserProgress((p) => ({ ...p, [id]: v })), ac.signal);
+        setBrowserInstalled(await installedModels());
+        setBrowserModelId(id);
+        setBrowserNotice(`${m.name} downloaded. It now runs in this browser.`);
+      } catch (e) {
+        setBrowserNotice((e as Error).name === "AbortError" ? "Download cancelled." : (e as Error).message);
+      } finally {
+        delete downloads.current[id];
+        setBrowserProgress((p) => {
+          const { [id]: _, ...rest } = p;
+          return rest;
+        });
+      }
+    },
+    cancel: (id: string) => downloads.current[id]?.abort(),
+    remove: async (id: string) => {
+      const m = BROWSER_MODELS.find((x) => x.id === id);
+      if (m) await deleteModel(m);
+      setBrowserInstalled(await installedModels());
+    },
+  };
+
+  const engine: Engine = lanReady
+    ? { kind: "lan", lan }
+    : browserReady && browserModel
+      ? { kind: "browser", model: browserModel }
+      : { kind: "builtin" };
+  /** A private local engine other than Gemini Nano (browser model or network server). */
+  const altLocal = engine.kind !== "builtin";
+  const localName = engine.kind === "lan" ? lan.model : engine.kind === "browser" ? engine.model.name : "Gemini Nano";
   useEffect(() => (user ? watchRemaining(user.uid, setCloudLeft) : undefined), [user]);
 
   /* ---------- pipeline ---------- */
   const doDeepDive = useCallback(
     async (base: Run, id: string | null) => {
-      const viaLan = engine.kind === "lan" && mode === "private";
+      const viaLan = altLocal && mode === "private";
       if (mode === "private" && !viaLan) {
-        patch({ error: "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a local network server for a private deep dive." });
+        patch({ error: "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a browser / network model for a private deep dive." });
         return;
       }
       if (!viaLan && !navigator.onLine) {
@@ -239,14 +327,20 @@ export default function App() {
         return;
       }
       patch({
-        pending: viaLan ? `Deep dive on your network (${lan.model})…` : "Deep dive in the cloud (sanitized trace only)…",
+        pending: viaLan ? `Private deep dive on ${localName}…` : "Deep dive in the cloud (sanitized trace only)…",
         analysis: "",
         error: null,
       });
       let text = "";
       try {
         if (user && !viaLan) await consumeCloudQuota(user.uid);
-        const gen = deepDive(base.sanitized, base.triage, cfg, viaLan && engine.kind === "lan" ? engine.lan : undefined);
+        const gen = deepDive(
+          base.sanitized,
+          base.triage,
+          cfg,
+          viaLan && engine.kind === "lan" ? engine.lan : undefined,
+          viaLan && engine.kind === "browser" ? engine.model : undefined,
+        );
         let r = await gen.next();
         while (!r.done) {
           text += r.value;
@@ -277,6 +371,9 @@ export default function App() {
       const dev = await deviceStatus();
       setDevice(dev);
 
+      if (engineKind === "browser" && !browserReady && mode !== "cloud") {
+        throw new Error("Download a model in ⚙ Settings → Open model in this browser, or switch to Cloud mode.");
+      }
       if (engineKind === "lan" && !lanReady && mode !== "cloud") {
         throw new Error(
           lanInfo?.online === false
@@ -284,10 +381,10 @@ export default function App() {
             : "Pick a model for your local network server in Settings.",
         );
       }
-      if (mode === "private" && dev !== "available" && engine.kind !== "lan") {
+      if (mode === "private" && dev !== "available" && !altLocal) {
         throw new Error("Private mode needs Gemini Nano on this device (or a local network server). Switch to Hybrid or Cloud mode.");
       }
-      const nano = (dev === "available" || engine.kind === "lan") && mode !== "cloud";
+      const nano = (dev === "available" || altLocal) && mode !== "cloud";
 
       if (image) {
         const cloudOk = allowCloudImage && mode !== "private";
@@ -312,7 +409,7 @@ export default function App() {
       }
 
       step({ pending: nano ? "Redacting on-device…" : "Redacting with local rules…" });
-      step({ pending: engine.kind === "lan" ? `Redacting on your network (${lan.model})…` : r.pending });
+      step({ pending: altLocal ? `Redacting privately on ${localName}…` : r.pending });
       const red = await redact(raw, dev, mode, engine);
       redactorRef.current = red.redactor;
       step({ sanitized: red.sanitized, redactions: red.redactions, steps: [...r.steps, ...red.logs] });
@@ -344,7 +441,7 @@ export default function App() {
       step({ pending: "Triaging…" });
       // Count cloud calls only; Gemini Nano is free and unmetered.
       const cloudPlanned =
-        engine.kind === "lan" && mode !== "cloud"
+        altLocal && mode !== "cloud"
           ? false
           : mode === "cloud" || device !== "available" || r.sanitized.length > cfg.maxOnDeviceChars;
       if (cloudPlanned) await consumeCloudQuota(user.uid);
@@ -441,7 +538,7 @@ export default function App() {
   };
 
   const canEscalate =
-    !!run.sanitized && !busy && !run.analysis && (mode === "private" ? engine.kind === "lan" : online);
+    !!run.sanitized && !busy && !run.analysis && (mode === "private" ? altLocal : online);
 
   return (
     <div className="app">
@@ -452,14 +549,19 @@ export default function App() {
           <span className="tag">secrets stay on your device</span>
         </div>
         <div className="status">
-          <span className={`pill pill-${device}`}>{DEVICE_LABEL[device]}</span>
+          {engineKind === "builtin" && <span className={`pill pill-${device}`}>{DEVICE_LABEL[device]}</span>}
+          {engineKind === "browser" && (
+            <span className={`pill ${browserReady ? "pill-available" : "pill-offline"}`}>
+              {browserReady && browserModel ? `${browserModel.shortName} · in browser` : "No browser model"}
+            </span>
+          )}
           {engineKind === "lan" && (
             <span className={`pill ${lanInfo?.online ? "pill-available" : "pill-offline"}`} title={lan.url}>
               LAN server {lanInfo?.online ? `online · ${lan.model || "no model"}` : "offline"}
             </span>
           )}
           <span className={`pill ${online ? "pill-online" : "pill-offline"}`}>{online ? "Online" : "Offline"}</span>
-          <button className="ghost" onClick={() => setSettingsOpen(true)} aria-label="Settings and setup">
+          <button className={`ghost ${inSettings ? "active" : ""}`} onClick={() => (inSettings ? closeSettings() : openSettings())} aria-label="Settings and setup">
             ⚙ Settings
           </button>
           {user?.isAnonymous ? (
@@ -474,7 +576,26 @@ export default function App() {
         </div>
       </header>
 
-      <div className="layout">
+      {inSettings && (
+        <SettingsPage
+          tab={settingsTab ?? tabForEngine(engineKind)}
+          setTab={(t) => {
+            // Switching tabs replaces the entry, so ← Back returns to the app, not the previous tab.
+            window.history.replaceState(null, "", `#/settings/${t}`);
+            setHash(`#/settings/${t}`);
+          }}
+          onBack={closeSettings}
+          device={device}
+          engine={engineKind}
+          setEngine={setEngineKind}
+          lan={lan}
+          setLan={setLan}
+          lanState={lanInfo}
+          setLanState={setLanInfo}
+          browser={browserProps}
+        />
+      )}
+      <div className="layout" hidden={inSettings}>
         <aside className="side">
           <section className="stats">
             <div>
@@ -514,7 +635,7 @@ export default function App() {
           {engineKind === "builtin" && (
             <DeviceSetup device={device} hw={hw} mode={mode} setMode={setMode} setDevice={setDevice} />
           )}
-          {engineKind === "lan" && (
+          {engineKind !== "builtin" && (
             <section className="card setup">
               <div className="row between">
                 <h2>Processing mode</h2>
@@ -526,10 +647,24 @@ export default function App() {
                   ))}
                 </div>
               </div>
-              <p className="muted small">
-                Local AI runs on <b>{lan.model || "(pick a model)"}</b> at <code>{lan.url}</code>{" "}
-                {lanInfo?.online ? "· online" : "· offline"}. {mode === "private" ? "Deep dives also stay on your network." : ""}
-              </p>
+              {engineKind === "lan" ? (
+                <p className="muted small">
+                  Local AI runs on <b>{lan.model || "(pick a model)"}</b> at <code>{lan.url}</code>{" "}
+                  {lanInfo?.online ? "· online" : "· offline"}. {mode === "private" ? "Deep dives also stay on your network." : ""}
+                </p>
+              ) : browserReady && browserModel ? (
+                <p className="notice small">
+                  Private steps run on <b>{browserModel.name}</b> inside this browser (Google AI Edge, WebGPU). Nothing
+                  leaves this device{mode === "private" ? ", including deep dives" : ""}.
+                </p>
+              ) : (
+                <div className="warn">
+                  No browser model downloaded yet.{" "}
+                  <button className="link" onClick={() => openSettings("browser")}>
+                    Open Browser models →
+                  </button>
+                </div>
+              )}
             </section>
           )}
 
@@ -613,7 +748,7 @@ export default function App() {
               <Confidence value={run.triage.confidence} />
               {canEscalate && (
                 <button className="primary" onClick={() => doDeepDive(run, run.id)}>
-                  {mode === "private" ? "Deep dive on my network →" : "Deep dive in cloud →"}
+                  {mode !== "private" ? "Deep dive in cloud →" : engine.kind === "browser" ? "Deep dive in this browser →" : "Deep dive on my network →"}
                 </button>
               )}
             </section>
@@ -654,24 +789,13 @@ export default function App() {
               {run.redactions.length > 0 && (
                 <div>
                   <h2>Kept on this device</h2>
-                  <RedactionList items={run.redactions} />
+                  <RedactionList items={run.redactions} localName={localName} />
                 </div>
               )}
             </section>
           )}
         </main>
       </div>
-      <Settings
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        device={device}
-        engine={engineKind}
-        setEngine={setEngineKind}
-        lan={lan}
-        setLan={setLan}
-        lanState={lanInfo}
-        setLanState={setLanInfo}
-      />
       <footer className="foot">
         Built with Firebase AI Logic hybrid inference · cloud model <code>{cfg.cloudModel}</code>
       </footer>

@@ -341,7 +341,7 @@ suspend fun redact(
         return try {
             val found = mutableListOf<Pair<String, String>>()
             for (part in chunk(text, 3_000).take(4)) {
-                val items = parseJson(Edge.generate(engine.ctx, engine.model, EDGE_SCRUB_PROMPT + part)).optJSONArray("items")
+                val items = parseJson(Edge.generate(engine.ctx, engine.model, EDGE_SCRUB_PROMPT + part + "\n\nEnd of log. Answer now with only the JSON object.")).optJSONArray("items")
                 for (i in 0 until (items?.length() ?: 0)) {
                     val o = items!!.getJSONObject(i)
                     found += o.optString("kind", "PII") to o.optString("value")
@@ -409,7 +409,7 @@ suspend fun triage(
     }
     if (engine is Engine.OnPhone && mode != ProcessingMode.CLOUD && sanitized.length <= 9_000) {
         val t0 = System.currentTimeMillis()
-        val tri = parseTriage(parseJson(Edge.generate(engine.ctx, engine.model, EDGE_TRIAGE_PROMPT + sanitized)))
+        val tri = parseTriage(parseJson(Edge.generate(engine.ctx, engine.model, EDGE_TRIAGE_PROMPT + sanitized + "\n\nEnd of trace. Answer now with only the JSON object.")))
         return tri to StepLog("Quick triage", StepSource.EDGE, System.currentTimeMillis() - t0, engine.model.name)
     }
     val nano = (engine as? Engine.Builtin)?.nano ?: NanoOption.STABLE
@@ -446,7 +446,17 @@ fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig, lan: LanConfig
     }
     // Private deep dive on your own network's bigger model.
     if (lan != null) return Lan.stream(lan, "You are a principal engineer.", prompt)
-    if (phone != null) return Edge.stream(phone.ctx, phone.model, prompt)
+    // Small on-phone models need a short task first and a "now write it" after the data: a long
+    // system-style preamble can make them return nothing, and ending on the trace makes them continue the log.
+    if (phone != null) {
+        val small = buildString {
+            append("Write a root-cause analysis in Markdown with these sections: ## Root cause, ## Fix (with a minimal code snippet), ")
+            append("## Why it happened, ## How to verify, ## Prevent it next time. Values like [EMAIL_1] are redacted placeholders.")
+            if (tri != null) append("\n\nQuick triage (may be wrong): ${tri.errorType} / ${tri.language}: ${tri.likelyCause}")
+            append("\n\nError trace:\n").append(sanitized).append("\n\n---\nNow write the analysis.")
+        }
+        return Edge.stream(phone.ctx, phone.model, small)
+    }
     val sb = StringBuilder()
     return deepModel(cfg).generateContentStream(prompt).map { chunk ->
         sb.append(chunk.text.orEmpty())

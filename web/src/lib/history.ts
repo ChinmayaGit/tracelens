@@ -38,6 +38,7 @@ export async function saveTrace(
 ): Promise<string> {
   const ref = await addDoc(col(uid), {
     ...data,
+    steps: storableSteps(data.steps),
     sanitized: data.sanitized.slice(0, MAX_STORED),
     platform: "web",
     createdAt: serverTimestamp(),
@@ -46,7 +47,12 @@ export async function saveTrace(
 }
 
 export function updateTrace(uid: string, id: string, patch: Partial<Omit<TraceDoc, "id">>) {
-  return updateDoc(doc(db, "users", uid, "traces", id), patch);
+  return updateDoc(doc(db, "users", uid, "traces", id), patch.steps ? { ...patch, steps: storableSteps(patch.steps) } : patch);
+}
+
+/** Browser-model steps count as on-device everywhere (Android/iOS/stats); the model name is in the note. */
+function storableSteps(steps: StepLog[]): StepLog[] {
+  return steps.map((s) => (s.source === "edge" ? { ...s, source: "on_device" } : s));
 }
 
 export function deleteTrace(uid: string, id: string) {

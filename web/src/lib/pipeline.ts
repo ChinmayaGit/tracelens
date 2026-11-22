@@ -10,13 +10,18 @@ import { ai } from "./firebase";
 import type { RoutingConfig } from "./config";
 import { Redactor, type Redaction } from "./redact";
 import { lanChat, lanStream, type LanConfig } from "./local";
+import { generate as edgeGenerate, stream as edgeStream, type BrowserModel } from "./edge";
 
 /**
  * Where local (private) inference runs:
  *  builtin – this browser's Gemini Nano (default)
  *  lan     – a bigger model on a machine in your own network (Ollama)
  */
-export type Engine = { kind: "builtin" } | { kind: "lan"; lan: LanConfig };
+export type Engine =
+  | { kind: "builtin" }
+  | { kind: "lan"; lan: LanConfig }
+  /** Open model (Gemma) running in this tab via Google AI Edge / WebGPU. */
+  | { kind: "browser"; model: BrowserModel };
 
 /* ------------------------------------------------------------------ */
 /* On-device availability (Chrome Prompt API)                          */
@@ -31,7 +36,13 @@ declare global {
 
 const MULTIMODAL: LanguageModelCreateOptions = {
   expectedInputs: [{ type: "text" }, { type: "image" }],
-  expectedOutputs: [{ type: "text" }],
+  expectedOutputs: [{ type: "text", languages: ["en"] }],
+};
+
+/** Gemini Nano: declaring the output language avoids Chrome's quality/safety warning. */
+const TEXT_EN: Pick<LanguageModelCreateOptions, "expectedInputs" | "expectedOutputs"> = {
+  expectedInputs: [{ type: "text", languages: ["en"] }],
+  expectedOutputs: [{ type: "text", languages: ["en"] }],
 };
 
 export async function deviceStatus(): Promise<DeviceStatus> {
@@ -134,7 +145,7 @@ const scrubModel = () =>
     getGenerativeModel(ai, {
       mode: InferenceMode.ONLY_ON_DEVICE,
       onDeviceParams: {
-        createOptions: { initialPrompts: [{ role: "system", content: [{ type: "text", value: SCRUB_SYSTEM }] }] },
+        createOptions: { ...TEXT_EN, initialPrompts: [{ role: "system", content: [{ type: "text", value: SCRUB_SYSTEM }] }] },
         promptOptions: { responseConstraint: SCRUB_SCHEMA },
       },
     }),
@@ -146,7 +157,7 @@ const triageModel = (cfg: RoutingConfig, mode: InferenceMode) =>
     getGenerativeModel(ai, {
       mode,
       onDeviceParams: {
-        createOptions: { initialPrompts: [{ role: "system", content: [{ type: "text", value: TRIAGE_SYSTEM }] }] },
+        createOptions: { ...TEXT_EN, initialPrompts: [{ role: "system", content: [{ type: "text", value: TRIAGE_SYSTEM }] }] },
         promptOptions: { responseConstraint: TRIAGE_SCHEMA },
       },
       inCloudParams: {
@@ -238,7 +249,7 @@ export function suggestMode(device: DeviceStatus, hw: Hardware): ProcessingMode 
 /* Pipeline steps                                                       */
 /* ------------------------------------------------------------------ */
 
-export type StepSource = InferenceSource | "local_rules" | "local_network" | "skipped";
+export type StepSource = InferenceSource | "local_rules" | "local_network" | "edge" | "skipped";
 
 export interface StepLog {
   step: "extract" | "redact_rules" | "redact_model" | "triage" | "deep";
@@ -317,6 +328,21 @@ export async function redact(
   logs.push({ step: "redact_rules", source: "local_rules", ms: now() - t });
 
   t = now();
+  if (engine.kind === "browser" && pmode !== "cloud") {
+    // Contextual pass on an open model running in this tab.
+    try {
+      const found: { kind: string; value: string }[] = [];
+      for (const part of chunk(text, 4000).slice(0, 4)) {
+        found.push(...(parseLoose<{ items?: { kind: string; value: string }[] }>(await edgeGenerate(engine.model, EDGE_SCRUB_PROMPT + part + "\n\nEnd of log. Answer now with only the JSON object."), "items").items ?? []));
+      }
+      text = r.applyLiterals(text, found);
+      logs.push({ step: "redact_model", source: "edge", ms: now() - t, note: engine.model.name });
+      return { redactor: r, sanitized: text, redactions: r.redactions, logs, modelRan: true };
+    } catch (e) {
+      logs.push({ step: "redact_model", source: "skipped", ms: now() - t, note: `${(e as Error).message}. Rule-based redaction only.` });
+      return { redactor: r, sanitized: text, redactions: r.redactions, logs, modelRan: false };
+    }
+  }
   if (engine.kind === "lan" && pmode !== "cloud") {
     // Contextual pass on a machine in your own network: still private.
     try {
@@ -368,6 +394,83 @@ export async function redact(
   return { redactor: r, sanitized: text, redactions: r.redactions, logs, modelRan: logs.some((l) => l.step === "redact_model" && l.source === "on_device") };
 }
 
+/** Balanced {...} spans in text (string-aware), in order of appearance. */
+function jsonCandidates(text: string): string[] {
+  const out: string[] = [];
+  for (let start = text.indexOf("{"); start >= 0; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let quote: string | null = null;
+    for (let k = start; k < text.length; k++) {
+      const c = text[k];
+      if (quote) {
+        if (c === "\\") k++;
+        else if (c === quote) quote = null;
+      } else if (c === '"' || c === "'") quote = c;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        out.push(text.slice(start, k + 1));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+const repairs = [
+  (t: string) => t,
+  // escaped JSON: \" and \n as text
+  (t: string) => t.replace(/\\"/g, '"').replace(/\\n/g, "\n"),
+  // JS/Python-style object: single quotes, unquoted keys, trailing commas, True/False
+  (t: string) =>
+    t
+      .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_m, g: string) => JSON.stringify(g))
+      .replace(/([{,]\s*)([A-Za-z_][\w]*)\s*:/g, '$1"$2":')
+      .replace(/,\s*([}\]])/g, "$1")
+      .replace(/\bTrue\b/g, "true")
+      .replace(/\bFalse\b/g, "false"),
+];
+
+/**
+ * Small models wrap JSON in prose, echo parts of the log (which may contain
+ * dicts of its own), use ```json fences, or escape the JSON. Prefer a fenced
+ * block, then the LAST balanced object that parses and has the expected key.
+ */
+function parseLoose<T>(text: string, mustHave: string): T {
+  const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1]);
+  const pools = [...fenced.flatMap(jsonCandidates).reverse(), ...jsonCandidates(text).reverse()];
+  for (const cand of pools) {
+    for (const fix of repairs) {
+      try {
+        const v = JSON.parse(fix(cand));
+        if (v && typeof v === "object" && mustHave in v) return v as T;
+      } catch {
+        /* try the next repair / candidate */
+      }
+    }
+  }
+  console.warn("Unparseable model output:", text.slice(0, 600));
+  throw new Error("The local model's answer wasn't valid JSON (try again, or pick a bigger model)");
+}
+
+// Small open models follow a concrete example far better than a schema.
+const EDGE_SCRUB_PROMPT =
+  "Find sensitive data in this software log: people's names, usernames, internal hostnames, customer/order IDs, " +
+  "organisation names, addresses, phone numbers, secret values. Copy each one EXACTLY as it appears. " +
+  "Ignore anything already in [BRACKETS], package names, file names, line numbers.\n" +
+  'Answer with only JSON like this example:\n{"items":[{"kind":"PERSON","value":"Jane Doe"},{"kind":"CUSTOMER_ID","value":"C-1029"}]}\n' +
+  'If nothing is sensitive answer {"items":[]}\n\nLOG:\n';
+
+const EDGE_DEEP_HEAD =
+  "Write a root-cause analysis in Markdown with these sections: ## Root cause, ## Fix (with a minimal code snippet), " +
+  "## Why it happened, ## How to verify, ## Prevent it next time. Values like [EMAIL_1] are redacted placeholders.";
+
+const EDGE_TRIAGE_PROMPT =
+  "You are a senior engineer. Triage this error log. Values like [EMAIL_1] are redacted placeholders.\n" +
+  "Answer with only JSON like this example (deliberately unrelated; do NOT copy it):\n" +
+  '{"isError":true,"errorType":"ValueError","language":"Python","summary":"int() was given a non-numeric string.",' +
+  '"likelyCause":"form field \'age\' contained \'abc\'","quickFix":"validate the field before calling int()","severity":"medium","confidence":0.7}\n' +
+  "severity is one of low, medium, high, critical. confidence is between 0 and 1. Describe the actual error below.\n\nTRACE:\n";
+
 /** Models sometimes answer 80 instead of 0.8. */
 function normConfidence(v: unknown): number {
   let c = Number(v) || 0;
@@ -390,6 +493,13 @@ export async function triage(
   pmode: ProcessingMode,
   engine: Engine = { kind: "builtin" },
 ): Promise<{ triage: Triage; log: StepLog }> {
+  if (engine.kind === "browser" && pmode !== "cloud" && sanitized.length <= 12_000) {
+    const t0 = now();
+    const tri = parseLoose<Triage>(await edgeGenerate(engine.model, EDGE_TRIAGE_PROMPT + sanitized + "\n\nEnd of trace. Answer now with only the JSON object."), "errorType");
+    tri.severity = (String(tri.severity || "medium").toLowerCase() as Triage["severity"]);
+    tri.confidence = tri.isError === false ? 0 : normConfidence(tri.confidence);
+    return { triage: tri, log: { step: "triage", source: "edge", ms: now() - t0, note: engine.model.name } };
+  }
   if (engine.kind === "lan" && pmode !== "cloud") {
     const t0 = now();
     const out = await lanChat(engine.lan, TRIAGE_SYSTEM, `Triage this trace:\n\n${sanitized}`, TRIAGE_SCHEMA);
@@ -433,6 +543,7 @@ export async function* deepDive(
   tri: Triage | null,
   cfg: RoutingConfig,
   lan?: LanConfig,
+  browserModel?: BrowserModel,
 ): AsyncGenerator<string, StepLog> {
   const t = now();
   const prompt = [
@@ -441,6 +552,17 @@ export async function* deepDive(
   ]
     .filter(Boolean)
     .join("\n\n");
+  if (browserModel) {
+    // Private deep dive on the open model running in this tab.
+    // Small open models need a short task first and a "now write it" after the data: a long
+    // system-style preamble makes Gemma return nothing, and ending on the trace makes it continue the log.
+    const small =
+      EDGE_DEEP_HEAD +
+      (tri ? `\n\nQuick triage (may be wrong): ${tri.errorType} / ${tri.language}: ${tri.likelyCause}` : "") +
+      `\n\nError trace:\n${sanitized}\n\n---\nNow write the analysis.`;
+    for await (const c of edgeStream(browserModel, small)) yield c;
+    return { step: "deep", source: "edge", ms: now() - t, note: browserModel.name };
+  }
   if (lan) {
     // Private deep dive on your own network's bigger model.
     for await (const c of lanStream(lan, DEEP_SYSTEM, prompt)) yield c;

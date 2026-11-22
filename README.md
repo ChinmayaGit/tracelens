@@ -9,15 +9,24 @@ Built for the Firebase **#BuildHybridAI** hackathon with the **Firebase AI Logic
 **Live demo:** https://tracelens-e8e9a.web.app (desktop Chrome recommended)
 
 <p align="center">
-  <img src="docs/screenshots/web-home.png" width="440" alt="Web">
-  <img src="docs/screenshots/android-home.jpg" width="200" alt="Android">
-  <img src="docs/screenshots/ios-home.png" width="200" alt="iOS">
+  <img src="docs/screenshots/web-home.png" width="820" alt="Web">
 </p>
-<p align="center"><sub>Web (Chrome + Gemini Nano) · Android (Qwen 2.5 on the phone) · iOS</sub></p>
+<p align="center"><sub>Web (Chrome + Gemini Nano)</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/android-home.jpg" width="260" alt="Android">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/screenshots/ios-home.png" width="260" alt="iOS">
+</p>
+<p align="center"><sub>Android (Qwen 2.5 on the phone) &nbsp;·&nbsp; iOS</sub></p>
 
 ### Local AI on every platform
 
-Private mode keeps every AI step off the cloud. Real runs: **Android** on a Realme X50 Pro (no Gemini Nano) and **iOS** in the iPhone 18 Pro simulator.
+Private mode keeps every AI step off the cloud. Real runs: **Web** in Chrome on an 8 GB M1 Mac, **Android** on a Realme X50 Pro (no Gemini Nano) and **iOS** in the iPhone 18 Pro simulator.
+
+**Web · Gemma 4 E2B running inside the browser (Google AI Edge, WebGPU)**: redaction 6.5 s · triage 4.0 s · deep dive 14 s, 100% on-device. It found the real bug: the data has `amountCents`, not `amount_cents`.
+
+<p align="center"><img src="docs/screenshots/web-browser-model-run.jpg" width="720" alt="Web: every step on Gemma 4 E2B in the browser"></p>
 
 | Android · Qwen 2.5 **on the phone** | Android · Llama 3.2 **on a network server** | iOS · Llama 3.2 **on a network server** | iOS · private deep dive |
 |:---:|:---:|:---:|:---:|
@@ -35,7 +44,7 @@ Private mode keeps every AI step off the cloud. Real runs: **Android** on a Real
 3. [Try it in 2 minutes](#try-it-in-2-minutes)
 4. [Set up Gemini Nano in Chrome](#set-up-gemini-nano-in-chrome)
 5. [Bigger models on your local network](#bigger-models-on-your-local-network)
-6. [Open models on the phone (Google AI Edge)](#open-models-on-the-phone-google-ai-edge)
+6. [Open models on the device (Google AI Edge)](#open-models-on-the-device-google-ai-edge)
 7. [Debug your installed apps](#debug-your-installed-apps)
 8. [Firebase setup](#firebase-setup-run-your-own-copy)
 9. [Run & build each platform](#run--build-each-platform)
@@ -65,7 +74,7 @@ Private mode keeps every AI step off the cloud. Real runs: **Android** on a Real
 
 | Section | What it shows |
 |---|---|
-| **Header pills** | `Gemini Nano ready` / `Apple Intelligence ready` / `No on-device AI` = local model status. `LAN server online/offline` = your network server. `Online/Offline` = internet. **⚙ Settings** opens engine choice and setup. |
+| **Header pills** | `Gemini Nano ready` / `Apple Intelligence ready` / `No on-device AI` = local model status. `LAN server online/offline` = your network server. `Online/Offline` = internet. **⚙ Settings** opens the Settings page (one tab per engine). |
 | **Processing mode** | **Hybrid**: local model first, cloud for fallback and deep dives. **Private**: nothing goes to the cloud. **Cloud**: for devices without a local model; secrets are still removed locally by rules. |
 | **Stats** | Traces analyzed, **secrets kept local**, and **% of AI steps that ran on-device** (the hybrid payoff). |
 | **Input** | Paste a trace, use a **sample**, drop a `.log` file, paste a **screenshot** (web), **share** text from any app (Android), import a crash file (🐞). Shows **cloud runs left today**. |
@@ -108,7 +117,7 @@ Private mode keeps every AI step off the cloud. Real runs: **Android** on a Real
 
 **Requirements (Chrome's, not ours):** desktop Chrome **139+** on Windows 10/11, macOS 13+ or Linux · **22 GB free disk** on the drive with your Chrome profile (the model itself is about 4 GB) · a GPU with **more than 4 GB VRAM**, or **16 GB RAM** with 4+ cores · an **unmetered** connection for the one-time download.
 
-TraceLens has a **⚙ Settings → Gemini Nano setup** checklist that checks each step live and has **Copy** buttons for every page. Web pages aren't allowed to open `chrome://` links themselves, so you paste them into the address bar.
+**⚙ Settings** is its own page with one tab per engine: **Gemini Nano**, **Browser models** and **Network server** (`#/settings/nano`, `/browser`, `/network`). Each tab shows its requirements and setup, with **✓ In use** or **Use this engine**. The Gemini Nano tab checks each setup step live and has **Copy** buttons for every page. Web pages aren't allowed to open `chrome://` links themselves, so you paste them into the address bar.
 
 | Step | Page | What to do |
 |---|---|---|
@@ -161,9 +170,30 @@ OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve # listen on the network, allow
 
 ---
 
-## Open models on the phone (Google AI Edge)
+## Open models on the device (Google AI Edge)
 
-**Android only.** Most phones don't have Gemini Nano (it needs AICore: Pixel 9+, Galaxy S24+ and similar). TraceLens can instead **download an open model and run it on the phone itself**, using Google's **MediaPipe LLM Inference** runtime, the same one the *Google AI Edge Gallery* app uses. Private mode then works on almost any recent Android phone, offline, with nothing leaving the device.
+Gemini Nano isn't everywhere, and on low-end machines it can be very slow (8 min per request on an 8 GB M1). TraceLens can instead **download an open model and run it on the device itself** with Google's **MediaPipe LLM Inference** runtime, the same one the *Google AI Edge Gallery* app uses.
+
+### Web: models in the browser (WebGPU)
+
+⚙ Settings → **Browser models** tab → **Download** → **Use this engine**. The model is stored in the browser's private storage (OPFS), so it downloads once, and it runs on your GPU.
+
+| Model | Download | Needs | Access |
+|---|---|---|---|
+| Gemma 3 270M | 0.28 GB | any WebGPU device | Hugging Face token |
+| Gemma 3 1B (int4) | 0.7 GB | ~4 GB memory | Hugging Face token |
+| **Gemma 4 E2B** (recommended) | 2.0 GB | ~6 GB memory | free |
+| Gemma 4 E4B | 3.0 GB | ~8 GB+ memory | free |
+
+Requires WebGPU: Chrome / Edge 121+ or Safari 26+. Measured on an 8 GB M1 MacBook Pro with Gemma 4 E2B: first load ~40 s, then redaction ~7 s, triage ~4 s, deep dive ~14 s.
+
+| Browser models tab | Network server tab | Gemini Nano tab |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/web-settings-browser.jpg" width="270" alt="Browser models tab"> | <img src="docs/screenshots/web-settings-network.jpg" width="270" alt="Network server tab"> | <img src="docs/screenshots/web-settings-nano.jpg" width="270" alt="Gemini Nano tab"> |
+
+### Android: models on the phone
+
+Most phones don't have Gemini Nano (it needs AICore: Pixel 9+, Galaxy S24+ and similar). TraceLens can instead **download an open model and run it on the phone itself**, using Google's **MediaPipe LLM Inference** runtime, the same one the *Google AI Edge Gallery* app uses. Private mode then works on almost any recent Android phone, offline, with nothing leaving the device.
 
 ⚙ Settings → **On-device model (Google AI Edge)** → **Download** a model → it becomes the private engine. The header shows e.g. **Qwen 2.5 · on-device**.
 
@@ -300,7 +330,8 @@ input (text / .log / screenshot / shared crash)
 | Hybrid pipeline | [pipeline.ts](web/src/lib/pipeline.ts) | [Pipeline.kt](android/app/src/main/java/dev/tracelens/Pipeline.kt) | [Pipeline.swift](ios/TraceLens/Pipeline.swift) |
 | Redaction rules | [redact.ts](web/src/lib/redact.ts) | [Redactor.kt](android/app/src/main/java/dev/tracelens/Redactor.kt) | [Redactor.swift](ios/TraceLens/Redactor.swift) |
 | Local network engine | [local.ts](web/src/lib/local.ts) | [Lan.kt](android/app/src/main/java/dev/tracelens/Lan.kt) | [Lan.swift](ios/TraceLens/Lan.swift) |
-| On-phone open models (AI Edge) | — | [Edge.kt](android/app/src/main/java/dev/tracelens/Edge.kt) | — |
+| Open models on device (AI Edge) | [edge.ts](web/src/lib/edge.ts) | [Edge.kt](android/app/src/main/java/dev/tracelens/Edge.kt) | — |
+| Settings page (tabs) | [SettingsPage.tsx](web/src/components/SettingsPage.tsx) | Settings sheet | Settings sheet |
 | Rate limiting | [quota.ts](web/src/lib/quota.ts) | [Quota.kt](android/app/src/main/java/dev/tracelens/Quota.kt) | [Store.swift](ios/TraceLens/Store.swift) |
 | Installed-app crashes | — | [Crashes.kt](android/app/src/main/java/dev/tracelens/Crashes.kt) | file import |
 

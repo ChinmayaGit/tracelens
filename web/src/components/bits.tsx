@@ -9,6 +9,7 @@ const SOURCE_LABEL: Record<StepSource, string> = {
   in_cloud: "Cloud · Gemini",
   local_rules: "Local rules",
   local_network: "Local network server",
+  edge: "On-device · AI Edge (browser)",
   skipped: "Skipped",
 };
 
@@ -61,7 +62,7 @@ export function Sanitized({ text }: { text: string }) {
 }
 
 /** Kept only in memory for this session; shows the user what stayed local. */
-export function RedactionList({ items }: { items: Redaction[] }) {
+export function RedactionList({ items, localName = "Gemini Nano" }: { items: Redaction[]; localName?: string }) {
   if (!items.length) return <p className="muted">Nothing sensitive found.</p>;
   return (
     <ul className="redactions">
@@ -71,7 +72,7 @@ export function RedactionList({ items }: { items: Redaction[] }) {
           <span className="secret" title="Never leaves this device">
             {r.original.length > 6 ? `${r.original.slice(0, 3)}•••${r.original.slice(-2)}` : "•••"}
           </span>
-          <span className={`by by-${r.by}`}>{r.by === "rule" ? "rule" : r.by === "user" ? "you" : "Gemini Nano"}</span>
+          <span className={`by by-${r.by}`}>{r.by === "rule" ? "rule" : r.by === "user" ? "you" : localName}</span>
         </li>
       ))}
     </ul>
