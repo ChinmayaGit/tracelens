@@ -1,0 +1,524 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  GoogleAuthProvider,
+  linkWithPopup,
+  onAuthStateChanged,
+  signInAnonymously,
+  signInWithPopup,
+  signOut,
+  type User,
+} from "firebase/auth";
+import { auth } from "./lib/firebase";
+import { DEFAULTS, loadRoutingConfig, type RoutingConfig } from "./lib/config";
+import {
+  deepDive,
+  detectHardware,
+  deviceStatus,
+  extractFromImage,
+  looksLikeError,
+  redact,
+  suggestMode,
+  triage as runTriage,
+  type DeviceStatus,
+  type Hardware,
+  type ProcessingMode,
+  type StepLog,
+  type Triage,
+} from "./lib/pipeline";
+import type { Redaction, Redactor } from "./lib/redact";
+import { deleteTrace, saveTrace, updateTrace, watchHistory, type TraceDoc } from "./lib/history";
+import { Confidence, Markdown, RedactionList, Sanitized, Timeline } from "./components/bits";
+import { DeviceSetup } from "./components/DeviceSetup";
+import { SAMPLES } from "./samples";
+
+interface Run {
+  id: string | null;
+  steps: StepLog[];
+  sanitized: string;
+  redactions: Redaction[];
+  triage: Triage | null;
+  analysis: string;
+  pending: string | null;
+  error: string | null;
+  /** Waiting for the user to approve what leaves the device. */
+  review: boolean;
+}
+
+const EMPTY_RUN: Run = {
+  id: null,
+  steps: [],
+  sanitized: "",
+  redactions: [],
+  triage: null,
+  analysis: "",
+  pending: null,
+  error: null,
+  review: false,
+};
+
+function useOnline() {
+  const [online, setOnline] = useState(navigator.onLine);
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    addEventListener("online", on);
+    addEventListener("offline", off);
+    return () => {
+      removeEventListener("online", on);
+      removeEventListener("offline", off);
+    };
+  }, []);
+  return online;
+}
+
+const MODE_KEY = "tracelens.mode";
+function savedMode(): ProcessingMode | null {
+  try {
+    const v = localStorage.getItem(MODE_KEY);
+    return v === "hybrid" || v === "private" || v === "cloud" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+const DEVICE_LABEL: Record<DeviceStatus, string> = {
+  available: "Gemini Nano ready",
+  downloadable: "Gemini Nano not downloaded",
+  downloading: "Gemini Nano downloading…",
+  unavailable: "On-device AI unavailable",
+  unsupported: "Browser has no on-device AI",
+};
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [cfg, setCfg] = useState<RoutingConfig>(DEFAULTS);
+  const [device, setDevice] = useState<DeviceStatus>("unsupported");
+  const [hw, setHw] = useState<Hardware | null>(null);
+  const [mode, setModeState] = useState<ProcessingMode>(savedMode() ?? "hybrid");
+  const setMode = useCallback((m: ProcessingMode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(MODE_KEY, m);
+    } catch {
+      /* storage blocked: mode just isn't remembered */
+    }
+  }, []);
+  const online = useOnline();
+
+  const [input, setInput] = useState("");
+  const [image, setImage] = useState<File | null>(null);
+  const [allowCloudImage, setAllowCloudImage] = useState(false);
+  const [run, setRun] = useState<Run>(EMPTY_RUN);
+  const [history, setHistory] = useState<TraceDoc[]>([]);
+  const busy = run.pending !== null;
+  const patch = (p: Partial<Run>) => setRun((r) => ({ ...r, ...p }));
+  const fileRef = useRef<HTMLInputElement>(null);
+  const redactorRef = useRef<Redactor | null>(null);
+  const [selection, setSelection] = useState("");
+  const previewRef = useRef<HTMLDivElement>(null);
+  /** Only accept text selected inside the preview that actually occurs in the sanitized trace. */
+  const captureSelection = () => {
+    const sel = getSelection();
+    const box = previewRef.current;
+    const text = sel?.toString().trim() ?? "";
+    const inside = !!box && !!sel?.anchorNode && !!sel.focusNode && box.contains(sel.anchorNode) && box.contains(sel.focusNode);
+    setSelection(inside && text && run.sanitized.includes(text) ? text : "");
+  };
+
+  /* ---------- boot ---------- */
+  useEffect(() => {
+    loadRoutingConfig().then(setCfg);
+    Promise.all([deviceStatus(), detectHardware()]).then(([d, h]) => {
+      setDevice(d);
+      setHw(h);
+      // First visit: pick a sensible default for this device.
+      if (!savedMode()) setModeState(suggestMode(d, h));
+      // Private needs Nano; fall back if it disappeared.
+      else if (savedMode() === "private" && d !== "available") setModeState("hybrid");
+    });
+    return onAuthStateChanged(auth, (u) => {
+      if (u) setUser(u);
+      else signInAnonymously(auth).catch((e) => patch({ error: `Sign-in failed: ${e.message}` }));
+    });
+  }, []);
+
+  useEffect(() => (user ? watchHistory(user.uid, setHistory) : undefined), [user]);
+
+  /* ---------- pipeline ---------- */
+  const doDeepDive = useCallback(
+    async (base: Run, id: string | null) => {
+      if (mode === "private") {
+        patch({ error: "Private mode: nothing is sent to the cloud. Switch to Hybrid for a cloud deep dive." });
+        return;
+      }
+      if (!navigator.onLine) {
+        patch({ error: "You're offline. The on-device triage above still works; deep dive needs the cloud." });
+        return;
+      }
+      patch({ pending: "Deep dive in the cloud (sanitized trace only)…", analysis: "", error: null });
+      let text = "";
+      try {
+        const gen = deepDive(base.sanitized, base.triage, cfg);
+        let r = await gen.next();
+        while (!r.done) {
+          text += r.value;
+          patch({ analysis: text });
+          r = await gen.next();
+        }
+        const steps = [...base.steps.filter((s) => s.step !== "deep"), r.value];
+        patch({ steps, pending: null });
+        if (user && id) await updateTrace(user.uid, id, { analysis: text, steps });
+      } catch (e) {
+        patch({ pending: null, error: `Deep dive failed: ${(e as Error).message}` });
+      }
+    },
+    [cfg, user, mode],
+  );
+
+  const analyze = async () => {
+    if (!user || busy) return;
+    let raw = input.trim();
+    let r: Run = { ...EMPTY_RUN, pending: "Starting…" };
+    setRun(r);
+    const step = (p: Partial<Run>) => {
+      r = { ...r, ...p };
+      setRun(r);
+    };
+
+    try {
+      const dev = await deviceStatus();
+      setDevice(dev);
+
+      if (mode === "private" && dev !== "available") {
+        throw new Error("Private mode needs Gemini Nano on this device. Switch to Hybrid or Cloud mode.");
+      }
+      const nano = dev === "available" && mode !== "cloud";
+
+      if (image) {
+        const cloudOk = allowCloudImage && mode !== "private";
+        if (!nano && !cloudOk) {
+          throw new Error(
+            "Reading screenshots privately needs Gemini Nano. Enable on-device AI, or tick “allow cloud for screenshots”.",
+          );
+        }
+        step({ pending: "Reading screenshot…" });
+        const { text, log } = await extractFromImage(image, nano ? false : cloudOk);
+        raw = [raw, text].filter(Boolean).join("\n\n");
+        setInput(raw);
+        setImage(null);
+        step({ steps: [log] });
+      }
+      if (!raw) throw new Error("Paste a stack trace, log, or drop a screenshot first.");
+      if (!looksLikeError(raw)) {
+        throw new Error(
+          "That doesn't look like an error, stack trace or log. Paste the failing output (or try one of the samples).",
+        );
+      }
+
+      step({ pending: nano ? "Redacting on-device…" : "Redacting with local rules…" });
+      const red = await redact(raw, dev, mode);
+      redactorRef.current = red.redactor;
+      step({ sanitized: red.sanitized, redactions: red.redactions, steps: [...r.steps, ...red.logs] });
+
+      if (!navigator.onLine && !nano) {
+        throw new Error("Offline and no on-device model: triage needs Gemini Nano or a connection.");
+      }
+      // Without Gemini Nano only rules ran, and the next step goes to the cloud:
+      // let the user check (and hide more) before anything leaves the device.
+      if (!nano) {
+        step({ pending: null, review: true });
+        return;
+      }
+      await triageAndSave(r);
+    } catch (e) {
+      setRun((cur) => ({ ...cur, pending: null, error: (e as Error).message }));
+    }
+  };
+
+  const triageAndSave = async (start: Run) => {
+    if (!user) return;
+    let r: Run = { ...start, review: false, error: null };
+    const step = (p: Partial<Run>) => {
+      r = { ...r, ...p };
+      setRun(r);
+    };
+    try {
+      step({ pending: "Triaging…" });
+      const tri = await runTriage(r.sanitized, cfg, mode);
+      step({ steps: [...r.steps, tri.log], pending: null });
+      if (tri.triage.isError === false) {
+        throw new Error("The model didn't find an error in this input, so nothing was saved. Paste the full failing output.");
+      }
+      step({ triage: tri.triage });
+
+      const counts: Record<string, number> = {};
+      for (const x of r.redactions) counts[x.kind] = (counts[x.kind] ?? 0) + 1;
+      const id = await saveTrace(user.uid, {
+        title: `${tri.triage.errorType} · ${tri.triage.language}`.slice(0, 120),
+        sanitized: r.sanitized,
+        triage: tri.triage,
+        analysis: null,
+        steps: r.steps,
+        redactionCounts: counts,
+        redactionTotal: r.redactions.length,
+      });
+      step({ id });
+
+      if (mode !== "private" && cfg.autoEscalate && tri.triage.confidence < cfg.escalateBelowConfidence && navigator.onLine) {
+        await doDeepDive(r, id);
+      }
+    } catch (e) {
+      step({ pending: null, error: (e as Error).message });
+    }
+  };
+
+  /** Review step: hide whatever the user highlighted in the preview. */
+  const hideSelection = () => {
+    const v = selection.trim();
+    if (!v || !redactorRef.current) return;
+    const sanitized = redactorRef.current.applyLiterals(run.sanitized, [{ kind: "HIDDEN", value: v }], "user");
+    patch({ sanitized, redactions: redactorRef.current.redactions });
+    setSelection("");
+    getSelection()?.removeAllRanges();
+  };
+
+  const openFromHistory = (d: TraceDoc) =>
+    setRun({
+      ...EMPTY_RUN,
+      id: d.id,
+      steps: d.steps ?? [],
+      sanitized: d.sanitized,
+      triage: d.triage,
+      analysis: d.analysis ?? "",
+    });
+
+  /* ---------- input helpers ---------- */
+  const onPaste = (e: React.ClipboardEvent) => {
+    const f = [...e.clipboardData.files].find((x) => /^image\/(png|jpeg)$/.test(x.type));
+    if (f) {
+      e.preventDefault();
+      setImage(f);
+    }
+  };
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const f = [...e.dataTransfer.files][0];
+    if (!f) return;
+    if (/^image\/(png|jpeg)$/.test(f.type)) setImage(f);
+    else f.text().then(setInput);
+  };
+
+  /* ---------- stats (judge-facing: proof of hybrid value) ---------- */
+  const stats = useMemo(() => {
+    let ai = 0;
+    let local = 0;
+    let secrets = 0;
+    for (const d of history) {
+      secrets += d.redactionTotal ?? 0;
+      for (const s of d.steps ?? []) {
+        if (s.source === "on_device" || s.source === "in_cloud") ai++;
+        if (s.source === "on_device") local++;
+      }
+    }
+    return { traces: history.length, secrets, onDevicePct: ai ? Math.round((local / ai) * 100) : 0 };
+  }, [history]);
+
+  const googleSignIn = async () => {
+    const provider = new GoogleAuthProvider();
+    try {
+      if (auth.currentUser?.isAnonymous) await linkWithPopup(auth.currentUser, provider);
+      else await signInWithPopup(auth, provider);
+    } catch (e) {
+      if ((e as { code?: string }).code === "auth/credential-already-in-use") await signInWithPopup(auth, provider);
+      else patch({ error: (e as Error).message });
+    }
+  };
+
+  const canEscalate = !!run.sanitized && !busy && !run.analysis && online && mode !== "private";
+
+  return (
+    <div className="app">
+      <header className="top">
+        <div className="brand">
+          <img src="/favicon.svg" alt="" width={28} height={28} />
+          <h1>TraceLens</h1>
+          <span className="tag">secrets stay on your device</span>
+        </div>
+        <div className="status">
+          <span className={`pill pill-${device}`}>{DEVICE_LABEL[device]}</span>
+          <span className={`pill ${online ? "pill-online" : "pill-offline"}`}>{online ? "Online" : "Offline"}</span>
+          {user?.isAnonymous ? (
+            <button className="ghost" onClick={googleSignIn}>
+              Sign in to sync
+            </button>
+          ) : user ? (
+            <button className="ghost" onClick={() => signOut(auth)} title={user.email ?? ""}>
+              Sign out
+            </button>
+          ) : null}
+        </div>
+      </header>
+
+      <div className="layout">
+        <aside className="side">
+          <section className="stats">
+            <div>
+              <b>{stats.traces}</b>
+              <span>traces</span>
+            </div>
+            <div>
+              <b>{stats.secrets}</b>
+              <span>secrets kept local</span>
+            </div>
+            <div>
+              <b>{stats.onDevicePct}%</b>
+              <span>AI steps on-device</span>
+            </div>
+          </section>
+          <h2>History</h2>
+          <ul className="history">
+            {history.map((d) => (
+              <li key={d.id} className={d.id === run.id ? "active" : ""}>
+                <button onClick={() => openFromHistory(d)}>
+                  <span className={`sev sev-${d.triage?.severity ?? "low"}`} />
+                  <span className="h-title">{d.title}</span>
+                  <span className="h-meta">
+                    {d.redactionTotal} redacted · {d.createdAt?.toDate().toLocaleDateString() ?? "pending sync"}
+                  </span>
+                </button>
+                <button className="x" aria-label="Delete" onClick={() => user && deleteTrace(user.uid, d.id)}>
+                  ×
+                </button>
+              </li>
+            ))}
+            {!history.length && <li className="muted">No traces yet. Try a sample.</li>}
+          </ul>
+        </aside>
+
+        <main className="main">
+          <DeviceSetup device={device} hw={hw} mode={mode} setMode={setMode} setDevice={setDevice} />
+
+          <section className="card input" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+            <div className="row between">
+              <h2>Paste an error, stack trace or log</h2>
+              <div className="samples">
+                {SAMPLES.map((s) => (
+                  <button key={s.label} className="chip" onClick={() => setInput(s.text)}>
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onPaste={onPaste}
+              spellCheck={false}
+              placeholder="Paste text, drop a .log file, or paste a screenshot (PNG/JPEG)…"
+            />
+            <div className="row between">
+              <div className="row">
+                <button className="ghost" onClick={() => fileRef.current?.click()}>
+                  {image ? `🖼 ${image.name}` : "Add screenshot"}
+                </button>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg"
+                  hidden
+                  onChange={(e) => setImage(e.target.files?.[0] ?? null)}
+                />
+                {image && (device !== "available" || mode === "cloud") && mode !== "private" && (
+                  <label className="consent">
+                    <input type="checkbox" checked={allowCloudImage} onChange={(e) => setAllowCloudImage(e.target.checked)} />
+                    allow cloud for screenshots (no Gemini Nano here)
+                  </label>
+                )}
+              </div>
+              <button className="primary" onClick={analyze} disabled={busy || !user || (!input.trim() && !image)}>
+                {busy ? "Working…" : "Analyze privately"}
+              </button>
+            </div>
+          </section>
+
+          {run.error && <div className="error">{run.error}</div>}
+
+          {(run.steps.length > 0 || run.pending) && (
+            <section className="card">
+              <h2>Pipeline</h2>
+              <Timeline steps={run.steps} pending={run.pending} />
+            </section>
+          )}
+
+          {run.triage && (
+            <section className={`card triage sev-border-${run.triage.severity}`}>
+              <div className="row between">
+                <h2>
+                  {run.triage.errorType} <small>{run.triage.language}</small>
+                </h2>
+                <span className={`sevtag sev-${run.triage.severity}`}>{run.triage.severity}</span>
+              </div>
+              <p className="summary">{run.triage.summary}</p>
+              <dl>
+                <dt>Likely cause</dt>
+                <dd>{run.triage.likelyCause}</dd>
+                <dt>Quick fix</dt>
+                <dd>{run.triage.quickFix}</dd>
+              </dl>
+              <Confidence value={run.triage.confidence} />
+              {canEscalate && (
+                <button className="primary" onClick={() => doDeepDive(run, run.id)}>
+                  Deep dive in cloud →
+                </button>
+              )}
+            </section>
+          )}
+
+          {run.analysis && (
+            <section className="card">
+              <h2>Root-cause analysis</h2>
+              <Markdown md={run.analysis} />
+            </section>
+          )}
+
+          {run.sanitized && (
+            <section className="card two">
+              <div>
+                <h2>{run.review ? "Review before sending to the cloud" : "What the cloud sees"}</h2>
+                {run.review && (
+                  <div className="warn review">
+                    Gemini Nano isn't running here, so only the rules removed secrets. Check for names, IDs or
+                    hostnames: <b>highlight any text below</b> to hide it, then send.
+                    <div className="row" style={{ marginTop: 8 }}>
+                      <button onClick={hideSelection} disabled={!selection.trim()}>
+                        {selection ? `Hide “${selection.slice(0, 24)}${selection.length > 24 ? "…" : ""}”` : "Highlight text in the log to hide it"}
+                      </button>
+                      <button className="primary" onClick={() => triageAndSave(run)}>
+                        Looks clean, send to cloud →
+                      </button>
+                      <button className="ghost" onClick={() => setRun(EMPTY_RUN)}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+                <div ref={previewRef} onMouseUp={() => run.review && captureSelection()} onKeyUp={() => run.review && captureSelection()}>
+                  <Sanitized text={run.sanitized} />
+                </div>
+              </div>
+              {run.redactions.length > 0 && (
+                <div>
+                  <h2>Kept on this device</h2>
+                  <RedactionList items={run.redactions} />
+                </div>
+              )}
+            </section>
+          )}
+        </main>
+      </div>
+      <footer className="foot">
+        Built with Firebase AI Logic hybrid inference · cloud model <code>{cfg.cloudModel}</code>
+      </footer>
+    </div>
+  );
+}

@@ -1,0 +1,8 @@
+{
+  "parameters": {
+    "cloud_model": { "defaultValue": { "value": "gemini-3.5-flash" }, "description": "Gemini model for cloud deep analysis", "valueType": "STRING" },
+    "escalate_below_confidence": { "defaultValue": { "value": "0.7" }, "description": "Auto deep-dive in cloud when on-device triage confidence is below this", "valueType": "NUMBER" },
+    "max_on_device_chars": { "defaultValue": { "value": "24000" }, "description": "Traces longer than this skip Gemini Nano triage", "valueType": "NUMBER" },
+    "auto_escalate": { "defaultValue": { "value": "true" }, "description": "Automatically escalate low-confidence triage to the cloud", "valueType": "BOOLEAN" }
+  }
+}

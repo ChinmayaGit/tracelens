@@ -1,0 +1,15 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Each user can only see their own sanitized traces.
+    match /users/{uid}/traces/{traceId} {
+      allow read, delete: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(
+             ['title', 'sanitized', 'triage', 'analysis', 'steps', 'redactionCounts', 'redactionTotal', 'createdAt'])
+        && request.resource.data.sanitized is string
+        && request.resource.data.sanitized.size() <= 40000;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.local
+.firebase/
+*.log
+.DS_Store
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/google-services.json
