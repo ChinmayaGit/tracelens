@@ -12,6 +12,15 @@ targets:
     type: application
     platform: iOS
     sources: [TraceLens]
+    info:
+      path: TraceLens/Info.plist
+      properties:
+        NSLocalNetworkUsageDescription: TraceLens can send redacted traces to an AI model running on a computer in your own network.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        UILaunchScreen: {}
+        CFBundleDisplayName: TraceLens
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.tracelens.ios

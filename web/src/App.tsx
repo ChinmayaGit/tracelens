@@ -29,6 +29,26 @@ import type { Redaction, Redactor } from "./lib/redact";
 import { deleteTrace, saveTrace, updateTrace, watchHistory, type TraceDoc } from "./lib/history";
 import { Confidence, Markdown, RedactionList, Sanitized, Timeline } from "./components/bits";
 import { DeviceSetup } from "./components/DeviceSetup";
+import { Settings, type EngineKind } from "./components/Settings";
+import { DEFAULT_LAN, lanStatus, type LanConfig, type LanStatus } from "./lib/local";
+import type { Engine } from "./lib/pipeline";
+
+/** Per-browser preferences (best effort; the app works without storage). */
+function loadPref<T>(key: string, fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? (JSON.parse(v) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function savePref(key: string, v: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(v));
+  } catch {
+    /* ignore */
+  }
+}
 import { consumeCloudQuota, watchRemaining, USER_DAILY_LIMIT } from "./lib/quota";
 import { SAMPLES } from "./samples";
 
@@ -176,24 +196,57 @@ export default function App() {
 
   useEffect(() => (user ? watchHistory(user.uid, setHistory) : undefined), [user]);
   const [cloudLeft, setCloudLeft] = useState(USER_DAILY_LIMIT);
+
+  /* ---------- local engine: built-in Nano (default) or a LAN server ---------- */
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [engineKind, setEngineKindState] = useState<EngineKind>(() => loadPref("tracelens.engine", "builtin"));
+  const [lan, setLanState] = useState<LanConfig>(() => loadPref("tracelens.lan", DEFAULT_LAN));
+  const [lanInfo, setLanInfo] = useState<LanStatus | null>(null);
+  const setEngineKind = (e: EngineKind) => {
+    setEngineKindState(e);
+    savePref("tracelens.engine", e);
+  };
+  const setLan = (l: LanConfig) => {
+    setLanState(l);
+    savePref("tracelens.lan", l);
+  };
+  // Keep the server's Online/Offline status fresh while it's selected.
+  useEffect(() => {
+    if (engineKind !== "lan") return;
+    let alive = true;
+    const tick = () => lanStatus(lan.url).then((st) => alive && setLanInfo(st));
+    tick();
+    const id = setInterval(tick, 15_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [engineKind, lan.url]);
+  const lanReady = engineKind === "lan" && !!lanInfo?.online && !!lan.model;
+  const engine: Engine = lanReady ? { kind: "lan", lan } : { kind: "builtin" };
   useEffect(() => (user ? watchRemaining(user.uid, setCloudLeft) : undefined), [user]);
 
   /* ---------- pipeline ---------- */
   const doDeepDive = useCallback(
     async (base: Run, id: string | null) => {
-      if (mode === "private") {
-        patch({ error: "Private mode: nothing is sent to the cloud. Switch to Hybrid for a cloud deep dive." });
+      const viaLan = engine.kind === "lan" && mode === "private";
+      if (mode === "private" && !viaLan) {
+        patch({ error: "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a local network server for a private deep dive." });
         return;
       }
-      if (!navigator.onLine) {
+      if (!viaLan && !navigator.onLine) {
         patch({ error: "You're offline. The on-device triage above still works; deep dive needs the cloud." });
         return;
       }
-      patch({ pending: "Deep dive in the cloud (sanitized trace only)…", analysis: "", error: null });
+      patch({
+        pending: viaLan ? `Deep dive on your network (${lan.model})…` : "Deep dive in the cloud (sanitized trace only)…",
+        analysis: "",
+        error: null,
+      });
       let text = "";
       try {
-        if (user) await consumeCloudQuota(user.uid);
-        const gen = deepDive(base.sanitized, base.triage, cfg);
+        if (user && !viaLan) await consumeCloudQuota(user.uid);
+        const gen = deepDive(base.sanitized, base.triage, cfg, viaLan && engine.kind === "lan" ? engine.lan : undefined);
         let r = await gen.next();
         while (!r.done) {
           text += r.value;
@@ -207,7 +260,7 @@ export default function App() {
         patch({ pending: null, error: `Deep dive failed: ${(e as Error).message}` });
       }
     },
-    [cfg, user, mode],
+    [cfg, user, mode, engine.kind, lan],
   );
 
   const analyze = async () => {
@@ -224,10 +277,17 @@ export default function App() {
       const dev = await deviceStatus();
       setDevice(dev);
 
-      if (mode === "private" && dev !== "available") {
-        throw new Error("Private mode needs Gemini Nano on this device. Switch to Hybrid or Cloud mode.");
+      if (engineKind === "lan" && !lanReady && mode !== "cloud") {
+        throw new Error(
+          lanInfo?.online === false
+            ? `Your local network server (${lan.url}) is offline. Start it, pick Built-in in Settings, or use Cloud mode.`
+            : "Pick a model for your local network server in Settings.",
+        );
       }
-      const nano = dev === "available" && mode !== "cloud";
+      if (mode === "private" && dev !== "available" && engine.kind !== "lan") {
+        throw new Error("Private mode needs Gemini Nano on this device (or a local network server). Switch to Hybrid or Cloud mode.");
+      }
+      const nano = (dev === "available" || engine.kind === "lan") && mode !== "cloud";
 
       if (image) {
         const cloudOk = allowCloudImage && mode !== "private";
@@ -252,7 +312,8 @@ export default function App() {
       }
 
       step({ pending: nano ? "Redacting on-device…" : "Redacting with local rules…" });
-      const red = await redact(raw, dev, mode);
+      step({ pending: engine.kind === "lan" ? `Redacting on your network (${lan.model})…` : r.pending });
+      const red = await redact(raw, dev, mode, engine);
       redactorRef.current = red.redactor;
       step({ sanitized: red.sanitized, redactions: red.redactions, steps: [...r.steps, ...red.logs] });
 
@@ -282,9 +343,12 @@ export default function App() {
     try {
       step({ pending: "Triaging…" });
       // Count cloud calls only; Gemini Nano is free and unmetered.
-      const cloudPlanned = mode === "cloud" || device !== "available" || r.sanitized.length > cfg.maxOnDeviceChars;
+      const cloudPlanned =
+        engine.kind === "lan" && mode !== "cloud"
+          ? false
+          : mode === "cloud" || device !== "available" || r.sanitized.length > cfg.maxOnDeviceChars;
       if (cloudPlanned) await consumeCloudQuota(user.uid);
-      const tri = await runTriage(r.sanitized, cfg, mode);
+      const tri = await runTriage(r.sanitized, cfg, mode, engine);
       // Hybrid can still fall back to the cloud if Nano fails: count it afterwards.
       if (!cloudPlanned && tri.log.source === "in_cloud") await consumeCloudQuota(user.uid).catch(() => {});
       step({ steps: [...r.steps, tri.log], pending: null });
@@ -376,7 +440,8 @@ export default function App() {
     }
   };
 
-  const canEscalate = !!run.sanitized && !busy && !run.analysis && online && mode !== "private";
+  const canEscalate =
+    !!run.sanitized && !busy && !run.analysis && (mode === "private" ? engine.kind === "lan" : online);
 
   return (
     <div className="app">
@@ -388,7 +453,15 @@ export default function App() {
         </div>
         <div className="status">
           <span className={`pill pill-${device}`}>{DEVICE_LABEL[device]}</span>
+          {engineKind === "lan" && (
+            <span className={`pill ${lanInfo?.online ? "pill-available" : "pill-offline"}`} title={lan.url}>
+              LAN server {lanInfo?.online ? `online · ${lan.model || "no model"}` : "offline"}
+            </span>
+          )}
           <span className={`pill ${online ? "pill-online" : "pill-offline"}`}>{online ? "Online" : "Offline"}</span>
+          <button className="ghost" onClick={() => setSettingsOpen(true)} aria-label="Settings and setup">
+            ⚙ Settings
+          </button>
           {user?.isAnonymous ? (
             <button className="ghost" onClick={googleSignIn}>
               Sign in to sync
@@ -438,7 +511,27 @@ export default function App() {
         </aside>
 
         <main className="main">
-          <DeviceSetup device={device} hw={hw} mode={mode} setMode={setMode} setDevice={setDevice} />
+          {engineKind === "builtin" && (
+            <DeviceSetup device={device} hw={hw} mode={mode} setMode={setMode} setDevice={setDevice} />
+          )}
+          {engineKind === "lan" && (
+            <section className="card setup">
+              <div className="row between">
+                <h2>Processing mode</h2>
+                <div className="seg" role="radiogroup" aria-label="Processing mode">
+                  {(["hybrid", "private", "cloud"] as const).map((m) => (
+                    <button key={m} role="radio" aria-checked={mode === m} className={mode === m ? "on" : ""} onClick={() => setMode(m)}>
+                      {m[0].toUpperCase() + m.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className="muted small">
+                Local AI runs on <b>{lan.model || "(pick a model)"}</b> at <code>{lan.url}</code>{" "}
+                {lanInfo?.online ? "· online" : "· offline"}. {mode === "private" ? "Deep dives also stay on your network." : ""}
+              </p>
+            </section>
+          )}
 
           <section className="card input" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
             <div className="row between">
@@ -520,7 +613,7 @@ export default function App() {
               <Confidence value={run.triage.confidence} />
               {canEscalate && (
                 <button className="primary" onClick={() => doDeepDive(run, run.id)}>
-                  Deep dive in cloud →
+                  {mode === "private" ? "Deep dive on my network →" : "Deep dive in cloud →"}
                 </button>
               )}
             </section>
@@ -536,7 +629,7 @@ export default function App() {
           {run.sanitized && (
             <section className="card two">
               <div>
-                <h2>{run.review ? "Review before sending to the cloud" : "What the cloud sees"}</h2>
+                <h2>{run.review ? "Review before sending to the cloud" : mode === "private" ? "Sanitized trace (stays private)" : "What the cloud sees"}</h2>
                 {run.review && (
                   <div className="warn review">
                     Gemini Nano isn't running here, so only the rules removed secrets. Check for names, IDs or
@@ -568,6 +661,17 @@ export default function App() {
           )}
         </main>
       </div>
+      <Settings
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        device={device}
+        engine={engineKind}
+        setEngine={setEngineKind}
+        lan={lan}
+        setLan={setLan}
+        lanState={lanInfo}
+        setLanState={setLanInfo}
+      />
       <footer className="foot">
         Built with Firebase AI Logic hybrid inference · cloud model <code>{cfg.cloudModel}</code>
       </footer>

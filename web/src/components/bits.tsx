@@ -8,6 +8,7 @@ const SOURCE_LABEL: Record<StepSource, string> = {
   on_device: "On-device · Gemini Nano",
   in_cloud: "Cloud · Gemini",
   local_rules: "Local rules",
+  local_network: "Local network server",
   skipped: "Skipped",
 };
 

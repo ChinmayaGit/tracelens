@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Firebase traffic is HTTPS. Plain HTTP is allowed only so the app can reach a
+     local-network Ollama server (e.g. http://192.168.1.20:11434), which has no TLS.
+     Android can't scope cleartext to private IP ranges, so it's permitted app-wide. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

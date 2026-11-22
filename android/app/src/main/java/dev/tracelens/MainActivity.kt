@@ -9,6 +9,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +37,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -127,6 +130,7 @@ fun TraceLensTheme(content: @Composable () -> Unit) {
 
 private fun sourceColor(s: StepSource) = when (s) {
     StepSource.ON_DEVICE -> DeviceGreen
+    StepSource.LOCAL_NETWORK -> Color(0xFF0E7490)
     StepSource.IN_CLOUD -> CloudBlue
     StepSource.LOCAL_RULES -> RulesPurple
     StepSource.SKIPPED -> Color.Gray
@@ -147,6 +151,8 @@ private fun sevColor(s: String) = when (s) {
 fun Screen(vm: MainViewModel) {
     val ui by vm.ui.collectAsState()
     val run = ui.run
+    if (ui.showSettings) SettingsSheet(ui, vm)
+    if (ui.showCrashes) CrashesSheet(ui, vm)
     Scaffold(
         topBar = {
             TopAppBar(
@@ -156,7 +162,13 @@ fun Screen(vm: MainViewModel) {
                         Text("secrets stay on your device", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                     }
                 },
-                actions = { DevicePill(ui.device) },
+                actions = {
+                    if (ui.useNetwork) {
+                        Badge(if (ui.lanStatus?.online == true) "LAN online" else "LAN offline",
+                            if (ui.lanStatus?.online == true) Color(0xFF0E7490) else Bad, Modifier.padding(end = 4.dp))
+                    } else DevicePill(ui.device)
+                    IconButton(onClick = { vm.showSettings(true) }) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
+                },
             )
         },
     ) { pad ->
@@ -174,7 +186,7 @@ fun Screen(vm: MainViewModel) {
             if (run.review) item { ReviewCard(run, vm) }
             run.triage?.let { t -> item { TriageCard(t, canEscalate = run.analysis.isEmpty() && run.pending == null && ui.mode != ProcessingMode.PRIVATE, vm) } }
             if (run.analysis.isNotEmpty()) item { Section("Root-cause analysis") { MarkdownText(run.analysis) } }
-            if (run.sanitized.isNotEmpty() && !run.review) item { SanitizedCard(run) }
+            if (run.sanitized.isNotEmpty() && !run.review) item { SanitizedCard(run, ui.mode == ProcessingMode.PRIVATE) }
             item { Text("History", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp)) }
             if (ui.history.isEmpty()) item { Text("No traces yet. Try a sample.", color = Color.Gray) }
             items(ui.history, key = { it.id }) { HistoryRow(it, vm) }
@@ -283,6 +295,13 @@ private fun ModeCard(ui: UiState, vm: MainViewModel) {
                 else LinearProgressIndicator(Modifier.fillMaxWidth())
                 TextButton(onClick = vm::cancelDownload) { Text("Cancel") }
             }
+            ui.useNetwork -> Banner(
+                if (ui.lanStatus?.online == true)
+                    "Private steps run on ${ui.lan.model.ifEmpty { "your server" }} at ${ui.lan.url}. Nothing leaves your network" +
+                        (if (ui.mode == ProcessingMode.PRIVATE) ", including deep dives." else ".")
+                else "Your local network server (${ui.lan.url}) is offline. Start it or switch to Built-in in Settings.",
+                if (ui.lanStatus?.online == true) Color(0xFF0E7490) else Bad,
+            )
             ui.device == DeviceStatus.UNAVAILABLE && ui.mode != ProcessingMode.CLOUD -> Banner(
                 "This phone can't run Gemini Nano (needs AICore, e.g. Pixel 9+ / Galaxy S24+). " +
                     "TraceLens uses the cloud with local rule-based redaction and asks you to review before sending.",
@@ -341,6 +360,9 @@ private fun InputCard(ui: UiState, vm: MainViewModel) {
             placeholder = { Text("Paste text, or share a crash log to TraceLens from any app…") },
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = vm::loadCrashes) {
+                Icon(Icons.Default.BugReport, contentDescription = "Import crashes from installed apps")
+            }
             IconButton(onClick = { clipboard.getText()?.text?.let(vm::setInput) }) {
                 Icon(Icons.Default.ContentPaste, contentDescription = "Paste")
             }
@@ -456,8 +478,8 @@ private fun TriageCard(t: Triage, canEscalate: Boolean, vm: MainViewModel) {
 }
 
 @Composable
-private fun SanitizedCard(run: RunState) {
-    Section("What the cloud sees") {
+private fun SanitizedCard(run: RunState, isPrivate: Boolean) {
+    Section(if (isPrivate) "Sanitized trace (stays private)" else "What the cloud sees") {
         SelectionContainer {
             Text(
                 highlighted(run.sanitized),
@@ -552,5 +574,142 @@ private fun bold(s: String) = buildAnnotatedString {
     parts.forEachIndexed { i, p ->
         if (i % 2 == 1) withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(p.replace("`", "")) }
         else append(p.replace("`", ""))
+    }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Settings: engine (built-in Nano / bigger model on LAN), requirements */
+/* ------------------------------------------------------------------ */
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsSheet(ui: UiState, vm: MainViewModel) {
+    androidx.compose.material3.ModalBottomSheet(onDismissRequest = { vm.showSettings(false) }) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 32.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Settings & setup", style = MaterialTheme.typography.titleLarge)
+            Text("Local AI engine", fontWeight = FontWeight.SemiBold)
+            Text("Used for private steps (redaction, triage). The cloud is only used in Hybrid/Cloud mode.",
+                fontSize = 12.sp, color = Color.Gray)
+
+            RadioRow(!ui.useNetwork, "Built-in: Gemini Nano (default)",
+                "Runs on this phone via AICore. Needs a supported device (Pixel 9+, Galaxy S24+…), ~3 GB free storage.") {
+                vm.setUseNetwork(false)
+            }
+            if (!ui.useNetwork) {
+                NanoOption.entries.forEach { o ->
+                    Row(Modifier.padding(start = 28.dp)) {
+                        RadioRow(ui.nano == o, o.label, o.detail) { vm.setNano(o) }
+                    }
+                }
+            }
+            RadioRow(ui.useNetwork, "Bigger model on my network",
+                "A powerful computer on your Wi-Fi runs the model (Ollama). Nothing leaves your network.") {
+                vm.setUseNetwork(true)
+            }
+            if (ui.useNetwork) LanSettings(ui, vm)
+        }
+    }
+}
+
+
+@Composable
+private fun RadioRow(selected: Boolean, title: String, detail: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 4.dp), verticalAlignment = Alignment.Top) {
+        androidx.compose.material3.RadioButton(selected = selected, onClick = onClick)
+        Column(Modifier.padding(top = 10.dp)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(detail, fontSize = 12.sp, color = Color.Gray)
+        }
+    }
+}
+
+@Composable
+private fun LanSettings(ui: UiState, vm: MainViewModel) {
+    val st = ui.lanStatus
+    Column(Modifier.padding(start = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Server", fontWeight = FontWeight.SemiBold)
+            Badge(if (st == null) "Unknown" else if (st.online) "Online" else "Offline",
+                if (st?.online == true) DeviceGreen else Bad)
+        }
+        OutlinedTextField(
+            value = ui.lan.url, onValueChange = { vm.setLan(ui.lan.copy(url = it)) },
+            label = { Text("Server address") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("http://192.168.1.20:11434") },
+        )
+        OutlinedButton(onClick = vm::testLan) { Text("Test connection") }
+        if (st != null && !st.online) {
+            Banner("The device at ${ui.lan.url} is offline or unreachable (${st.error}). Make sure it's on the same Wi-Fi " +
+                "and running:  OLLAMA_HOST=0.0.0.0 ollama serve", Bad)
+        }
+        if (st?.online == true) {
+            Text("Model on this server", fontSize = 13.sp)
+            st.models.forEach { m ->
+                RadioRow(ui.lan.model == m.name, m.name, "${m.params.ifEmpty { "${m.sizeGb} GB" }} · needs ~${m.minRamGb} GB RAM on the server") {
+                    vm.setLan(ui.lan.copy(model = m.name))
+                }
+            }
+            if (st.models.isEmpty()) Text("No models installed. Run: ollama pull qwen2.5-coder:7b", fontSize = 12.sp)
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            androidx.compose.material3.Switch(checked = ui.lan.memorySaver, onCheckedChange = { vm.setLan(ui.lan.copy(memorySaver = it)) })
+            Column(Modifier.padding(start = 10.dp)) {
+                Text("Memory saver (stream weights from disk)", fontWeight = FontWeight.Medium)
+                Text("Memory-maps the model file so only the layers in use sit in RAM, smaller context window, unloads " +
+                    "after 1 min idle. Lets a big model run on a smaller machine; first answer is slower.",
+                    fontSize = 12.sp, color = Color.Gray)
+            }
+        }
+        Text("Recommended models (min RAM on the server)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+        RECOMMENDED_LAN_MODELS.forEach { (name, ram, note) ->
+            Text("• $name: $ram GB · $note", fontSize = 12.sp)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Debug installed apps: recent crashes from the system crash buffer    */
+/* ------------------------------------------------------------------ */
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CrashesSheet(ui: UiState, vm: MainViewModel) {
+    val clipboard = LocalClipboardManager.current
+    androidx.compose.material3.ModalBottomSheet(onDismissRequest = vm::hideCrashes) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Recent app crashes", style = MaterialTheme.typography.titleLarge)
+            if (!ui.crashesAllApps) {
+                Banner("Android only lets TraceLens read other apps' crashes after a one-time grant from a computer " +
+                    "(USB debugging on). Until then you only see TraceLens's own crashes.", Warn)
+                Text(Crashes.GRANT_COMMAND, fontFamily = Mono, fontSize = 11.sp,
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)).padding(8.dp))
+                OutlinedButton(onClick = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(Crashes.GRANT_COMMAND)) }) {
+                    Text("Copy command")
+                }
+            }
+            when {
+                ui.crashes == null -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text("Reading crash log…")
+                }
+                ui.crashes.isEmpty() -> Text("No recent crashes found.", color = Color.Gray)
+                else -> ui.crashes.forEach { c ->
+                    Card(Modifier.fillMaxWidth().clickable { vm.pickCrash(c) }) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(c.app, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(c.exception, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(c.time, fontSize = 11.sp, color = Color.Gray)
+                        }
+                    }
+                }
+            }
+            Text("Tap a crash to load it. It's redacted before any AI sees it.", fontSize = 12.sp, color = Color.Gray)
+        }
     }
 }

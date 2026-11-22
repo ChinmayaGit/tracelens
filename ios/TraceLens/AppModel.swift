@@ -29,12 +29,52 @@ final class AppModel {
     var online = true
     var refreshing = false
     var cloudLeft = userDailyLimit
+    /// false = Apple Intelligence on this device (default); true = model on a local network server.
+    var useNetwork = UserDefaults.standard.bool(forKey: "useNetwork") {
+        didSet { UserDefaults.standard.set(useNetwork, forKey: "useNetwork"); if useNetwork { checkLan() } }
+    }
+    var lan: LanConfig = (UserDefaults.standard.data(forKey: "lan").flatMap { try? JSONDecoder().decode(LanConfig.self, from: $0) }) ?? LanConfig() {
+        didSet { UserDefaults.standard.set(try? JSONEncoder().encode(lan), forKey: "lan") }
+    }
+    var lanStatus: LanStatus?
+    var showSettings = false
 
     @ObservationIgnored private var redactor: Redactor?
     @ObservationIgnored private var historyReg: ListenerRegistration?
     @ObservationIgnored private var quotaReg: ListenerRegistration?
     @ObservationIgnored private var configLoaded = false
     @ObservationIgnored private let monitor = NWPathMonitor()
+    @ObservationIgnored private var lanTask: Task<Void, Never>?
+
+    /// Check the LAN server now, then keep its Online/Offline status fresh every 15 s.
+    func checkLan() {
+        lanTask?.cancel()
+        lanTask = Task {
+            while !Task.isCancelled {
+                let st = await Lan.status(lan.url)
+                lanStatus = st
+                if st.online, lan.model.isEmpty, let first = st.models.first { lan.model = first.name }
+                if !useNetwork { break }
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
+    }
+
+    private var engine: Engine {
+        if useNetwork, lanStatus?.online == true, !lan.model.isEmpty { return .network(lan) }
+        return .builtin
+    }
+
+    /// iOS apps can't read other apps' crash logs; users share or pick an .ips/.crash/.log file instead.
+    func importCrashFile(_ url: URL) {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        if let text = try? String(contentsOf: url, encoding: .utf8) {
+            input = String(text.prefix(60_000))
+        } else {
+            run.error = "Couldn't read that file as text."
+        }
+    }
 
     init() {
         let saved = UserDefaults.standard.string(forKey: "mode").flatMap(ProcessingMode.init(rawValue:))
@@ -49,6 +89,11 @@ final class AppModel {
             // Test hook for headless simulator runs: TL_AUTORUN=<sample index> [TL_MODE=cloud|hybrid|private]
             let env = ProcessInfo.processInfo.environment
             if let m = env["TL_MODE"].flatMap(ProcessingMode.init(rawValue:)) { self.mode = m }
+            if let url = env["TL_LAN"] {
+                self.lan.url = url
+                self.useNetwork = true
+                while self.lanStatus?.online != true || self.lan.model.isEmpty { try? await Task.sleep(for: .milliseconds(300)) }
+            }
             if let i = env["TL_AUTORUN"].flatMap(Int.init), samples.indices.contains(i) {
                 self.input = samples[i].1
                 while self.uid == nil { try? await Task.sleep(for: .milliseconds(300)) }
@@ -70,6 +115,7 @@ final class AppModel {
             }
         }
         monitor.start(queue: DispatchQueue(label: "net"))
+        if useNetwork { checkLan() }
         refresh()
     }
 
@@ -119,16 +165,23 @@ final class AppModel {
         Task {
             do {
                 device = await Task.detached { Pipeline.deviceStatus() }.value
-                if mode == .private && device != .available {
-                    throw AppError("Private mode needs Apple Intelligence on this device. Switch to Hybrid or Cloud mode.")
+                let eng = engine
+                if useNetwork, case .builtin = eng, mode != .cloud {
+                    throw AppError(lanStatus?.online == false
+                        ? "Your local network server (\(lan.url)) is offline. Start it, switch to Built-in in Settings, or use Cloud mode."
+                        : "Pick a model for your local network server in Settings.")
+                }
+                let onLan: Bool = { if case .network = eng { return true }; return false }()
+                if mode == .private && device != .available && !onLan {
+                    throw AppError("Private mode needs Apple Intelligence on this device (or a local network server). Switch to Hybrid or Cloud mode.")
                 }
                 guard !raw.isEmpty else { throw AppError("Paste a stack trace or log first.") }
                 guard looksLikeError(raw) else {
                     throw AppError("That doesn't look like an error, stack trace or log. Paste the failing output (or try a sample).")
                 }
-                let nano = device == .available && mode != .cloud
+                let nano = (device == .available || onLan) && mode != .cloud
                 run.pending = nano ? "Redacting on-device…" : "Redacting with local rules…"
-                let red = await Pipeline.redact(raw, device: device, mode: mode)
+                let red = await Pipeline.redact(raw, device: device, mode: mode, engine: eng)
                 redactor = red.redactor
                 run.sanitized = red.sanitized
                 run.redactions = red.redactor.redactions
@@ -166,9 +219,12 @@ final class AppModel {
         run.pending = "Triaging…"
         do {
             // Count cloud calls only; Apple Intelligence on-device is free and unmetered.
-            let cloudPlanned = Pipeline.triageNeedsCloud(run.sanitized, device: device, mode: mode, cfg: config)
+            let eng = engine
+            let onLan: Bool = { if case .network = eng { return true }; return false }()
+            let cloudPlanned = onLan && mode != .cloud ? false
+                : Pipeline.triageNeedsCloud(run.sanitized, device: device, mode: mode, cfg: config)
             if cloudPlanned { try await Quota.consume(uid: uid) }
-            let (tri, log) = try await Pipeline.triage(run.sanitized, device: device, mode: mode, cfg: config)
+            let (tri, log) = try await Pipeline.triage(run.sanitized, device: device, mode: mode, cfg: config, engine: eng)
             if !cloudPlanned && log.source == .inCloud { try? await Quota.consume(uid: uid) }
             run.steps.append(log)
             run.pending = nil
@@ -189,21 +245,23 @@ final class AppModel {
     func startDeepDive() { Task { await deepDive() } }
 
     private func deepDive() async {
-        guard mode != .private else {
-            run.error = "Private mode: nothing is sent to the cloud. Switch to Hybrid for a deep dive."
+        var viaLan: LanConfig? = nil
+        if case .network(let l) = engine, mode == .private { viaLan = l }
+        guard mode != .private || viaLan != nil else {
+            run.error = "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a local network server for a private deep dive."
             return
         }
-        run.pending = "Deep dive in the cloud (sanitized trace only)…"
+        run.pending = viaLan != nil ? "Deep dive on your network (\(lan.model))…" : "Deep dive in the cloud (sanitized trace only)…"
         run.analysis = ""
         run.error = nil
         let t = Date()
         do {
-            if let uid { try await Quota.consume(uid: uid) }
-            for try await text in Pipeline.deepDive(run.sanitized, triage: run.triage, cfg: config) {
+            if let uid, viaLan == nil { try await Quota.consume(uid: uid) }
+            for try await text in Pipeline.deepDive(run.sanitized, triage: run.triage, cfg: config, lan: viaLan) {
                 run.analysis = text
             }
             run.steps.removeAll { $0.step == "deep" }
-            run.steps.append(StepLog(step: "deep", source: .inCloud, ms: Int(Date().timeIntervalSince(t) * 1000)))
+            run.steps.append(StepLog(step: "deep", source: viaLan != nil ? .localNetwork : .inCloud, ms: Int(Date().timeIntervalSince(t) * 1000)))
             run.pending = nil
             tl("deep dive done, \(run.analysis.count) chars")
             if let uid, let id = run.id {

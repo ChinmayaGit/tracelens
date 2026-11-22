@@ -26,16 +26,41 @@ enum ProcessingMode: String, CaseIterable, Identifiable {
 }
 
 enum StepSource: String {
-    case onDevice = "on_device", inCloud = "in_cloud", localRules = "local_rules", skipped
+    case onDevice = "on_device", inCloud = "in_cloud", localRules = "local_rules", localNetwork = "local_network", skipped
     var label: String {
         switch self {
         case .onDevice: "On-device · Apple Intelligence"
         case .inCloud: "Cloud · Gemini"
         case .localRules: "Local rules"
+        case .localNetwork: "Local network server"
         case .skipped: "Skipped"
         }
     }
 }
+
+/// Where private (non-cloud) inference runs.
+enum Engine {
+    case builtin            // Apple Intelligence on this device (default)
+    case network(LanConfig) // a bigger model on a machine in your own network
+}
+
+private let lanScrubSchema: [String: Any] = [
+    "type": "object",
+    "properties": ["items": ["type": "array", "items": [
+        "type": "object",
+        "properties": ["kind": ["type": "string"], "value": ["type": "string"]],
+        "required": ["kind", "value"]]]],
+    "required": ["items"],
+]
+private let lanTriageSchema: [String: Any] = [
+    "type": "object",
+    "properties": [
+        "isError": ["type": "boolean"], "errorType": ["type": "string"], "language": ["type": "string"],
+        "summary": ["type": "string"], "likelyCause": ["type": "string"], "quickFix": ["type": "string"],
+        "severity": ["type": "string", "enum": ["low", "medium", "high", "critical"]], "confidence": ["type": "number"],
+    ],
+    "required": ["isError", "errorType", "language", "summary", "likelyCause", "quickFix", "severity", "confidence"],
+]
 
 struct StepLog: Identifiable, Hashable {
     let id = UUID()
@@ -177,13 +202,34 @@ enum Pipeline {
     }
 
     /// Privacy gate: rules always; the contextual pass is on-device only, never cloud.
-    static func redact(_ raw: String, device: DeviceStatus, mode: ProcessingMode) async -> RedactResult {
+    static func redact(_ raw: String, device: DeviceStatus, mode: ProcessingMode, engine: Engine = .builtin) async -> RedactResult {
         let r = Redactor()
         var logs: [StepLog] = []
         var t = Date()
         var text = r.applyRules(raw)
         logs.append(StepLog(step: "redact_rules", source: .localRules, ms: ms(since: t)))
 
+        if case .network(let lan) = engine, mode != .cloud {
+            // Contextual pass on a machine in your own network: still private.
+            t = Date()
+            do {
+                var found: [(kind: String, value: String)] = []
+                for part in chunk(text, size: 12_000).prefix(4) {
+                    let out = try await Lan.chat(lan, system: scrubInstructions, prompt: "LOG:\n\(part)", schema: lanScrubSchema)
+                    let obj = try JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any]
+                    for item in obj?["items"] as? [[String: Any]] ?? [] {
+                        found.append((kind: item["kind"] as? String ?? "PII", value: item["value"] as? String ?? ""))
+                    }
+                }
+                text = r.applyLiterals(text, found)
+                logs.append(StepLog(step: "redact_model", source: .localNetwork, ms: ms(since: t), note: lan.model))
+                return RedactResult(redactor: r, sanitized: text, logs: logs, modelRan: true)
+            } catch {
+                logs.append(StepLog(step: "redact_model", source: .skipped, ms: ms(since: t),
+                                    note: "\(error.localizedDescription) Rule-based redaction only."))
+                return RedactResult(redactor: r, sanitized: text, logs: logs, modelRan: false)
+            }
+        }
         guard mode != .cloud, device == .available else {
             let why = mode == .cloud ? "Cloud mode" : "Apple Intelligence not available"
             logs.append(StepLog(step: "redact_model", source: .skipped, ms: 0, note: "\(why): rule-based redaction only"))
@@ -225,7 +271,21 @@ enum Pipeline {
         mode == .cloud || device != .available || sanitized.count > min(cfg.maxOnDeviceChars, iosOnDeviceMaxChars)
     }
 
-    static func triage(_ sanitized: String, device: DeviceStatus, mode: ProcessingMode, cfg: RoutingConfig) async throws -> (Triage, StepLog) {
+    static func triage(_ sanitized: String, device: DeviceStatus, mode: ProcessingMode, cfg: RoutingConfig,
+                       engine: Engine = .builtin) async throws -> (Triage, StepLog) {
+        if case .network(let lan) = engine, mode != .cloud {
+            let t0 = Date()
+            let out = try await Lan.chat(lan, system: triageInstructions, prompt: "Triage this trace:\n\n\(sanitized)", schema: lanTriageSchema)
+            guard let o = try JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any] else {
+                throw AppError("Local model returned invalid JSON.")
+            }
+            let tri = Triage(isError: o["isError"] as? Bool ?? true, errorType: o["errorType"] as? String ?? "Error",
+                             language: o["language"] as? String ?? "", summary: o["summary"] as? String ?? "",
+                             likelyCause: o["likelyCause"] as? String ?? "", quickFix: o["quickFix"] as? String ?? "",
+                             severity: o["severity"] as? String ?? "medium",
+                             confidence: (o["confidence"] as? NSNumber)?.doubleValue ?? 0)
+            return (normalized(tri), StepLog(step: "triage", source: .localNetwork, ms: ms(since: t0), note: lan.model))
+        }
         let limit = min(cfg.maxOnDeviceChars, iosOnDeviceMaxChars)
         let tooLong = sanitized.count > limit
         if mode == .private && tooLong {
@@ -259,18 +319,22 @@ enum Pipeline {
     private static func normalized(_ t: Triage) -> Triage {
         var t = t
         t.severity = t.severity.lowercased()
-        t.confidence = t.isError ? min(max(t.confidence, 0), 1) : 0
+        // Models sometimes answer 80 instead of 0.8.
+        let c = t.confidence > 1 ? t.confidence / 100 : t.confidence
+        t.confidence = t.isError ? min(max(c, 0), 1) : 0
         return t
     }
 
     // MARK: Deep dive (cloud only, sanitized text only)
 
-    static func deepDive(_ sanitized: String, triage: Triage?, cfg: RoutingConfig) -> AsyncThrowingStream<String, Error> {
+    static func deepDive(_ sanitized: String, triage: Triage?, cfg: RoutingConfig, lan: LanConfig? = nil) -> AsyncThrowingStream<String, Error> {
         var prompt = ""
         if let tri = triage {
             prompt += "On-device triage (may be wrong): \(tri.errorType) / \(tri.language): \(tri.likelyCause)\n\n"
         }
         prompt += "Sanitized trace:\n\(sanitized)"
+        // Private deep dive on your own network's bigger model.
+        if let lan { return Lan.stream(lan, system: deepInstructions, prompt: prompt) }
         let session = cloudSession(deepInstructions, cfg)
         let p = prompt
         return AsyncThrowingStream { continuation in

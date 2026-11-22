@@ -17,3 +17,7 @@ ios/TraceLens/GoogleService-Info.plist
 ios/*.xcodeproj/
 ios/build/
 ios/DerivedData/
+android/keystore.properties
+android/*.jks
+android/app/*.jks
+release/

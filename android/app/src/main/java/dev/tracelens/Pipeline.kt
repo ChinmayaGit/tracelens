@@ -7,6 +7,7 @@ import com.google.firebase.ai.GenerativeModel
 import com.google.firebase.ai.InferenceMode
 import com.google.firebase.ai.InferenceSource
 import com.google.firebase.ai.OnDeviceConfig
+import com.google.firebase.ai.OnDeviceModelOption
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.ondevice.DownloadStatus
 import com.google.firebase.ai.ondevice.FirebaseAIOnDevice
@@ -32,7 +33,21 @@ enum class StepSource(val label: String) {
     ON_DEVICE("On-device · Gemini Nano"),
     IN_CLOUD("Cloud · Gemini"),
     LOCAL_RULES("Local rules"),
+    LOCAL_NETWORK("Local network server"),
     SKIPPED("Skipped"),
+}
+
+/** Which Gemini Nano build AICore runs (PREVIEW options need the AICore developer preview). */
+enum class NanoOption(val label: String, val detail: String, val option: OnDeviceModelOption) {
+    STABLE("Gemini Nano (stable)", "Default. Pixel 9+/Galaxy S24+ class devices with AICore.", OnDeviceModelOption.STABLE),
+    FAST("Gemini Nano Fast (preview)", "Smaller & faster, lower quality. Needs AICore developer preview.", OnDeviceModelOption.PREVIEW_FAST),
+    LATEST("Gemini Nano latest (preview)", "Newest, larger model. Needs AICore developer preview + more RAM.", OnDeviceModelOption.PREVIEW),
+}
+
+/** Where private (non-cloud) inference runs. */
+sealed interface Engine {
+    data class Builtin(val nano: NanoOption = NanoOption.STABLE) : Engine
+    data class Network(val lan: LanConfig) : Engine
 }
 
 data class StepLog(val step: String, val source: StepSource, val ms: Long, val note: String? = null)
@@ -148,20 +163,22 @@ private fun jsonConfig(schema: Schema) = generationConfig {
     temperature = 0.2f
 }
 
-private fun scrubModel(cfg: RoutingConfig) = model("scrub") {
+private fun scrubModel(cfg: RoutingConfig, nano: NanoOption) = model("scrub:$nano") {
     ai.generativeModel(
         modelName = cfg.cloudModel,
         generationConfig = jsonConfig(SCRUB_SCHEMA),
         // Privacy gate: never falls back to the cloud.
-        onDeviceConfig = OnDeviceConfig(mode = InferenceMode.ONLY_ON_DEVICE, maxOutputTokens = 256, temperature = 0f),
+        onDeviceConfig = OnDeviceConfig(
+            mode = InferenceMode.ONLY_ON_DEVICE, maxOutputTokens = 256, temperature = 0f, modelOption = nano.option,
+        ),
     )
 }
 
-private fun triageModel(cfg: RoutingConfig, mode: InferenceMode) = model("triage:$mode:${cfg.cloudModel}") {
+private fun triageModel(cfg: RoutingConfig, mode: InferenceMode, nano: NanoOption) = model("triage:$mode:$nano:${cfg.cloudModel}") {
     ai.generativeModel(
         modelName = cfg.cloudModel,
         generationConfig = jsonConfig(TRIAGE_SCHEMA),
-        onDeviceConfig = OnDeviceConfig(mode = mode, maxOutputTokens = 256, temperature = 0.2f),
+        onDeviceConfig = OnDeviceConfig(mode = mode, maxOutputTokens = 256, temperature = 0.2f, modelOption = nano.option),
     )
 }
 
@@ -229,13 +246,69 @@ private fun chunk(text: String, size: Int): List<String> {
 }
 
 /** Privacy gate: rules always; contextual pass is ONLY_ON_DEVICE. */
-suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg: RoutingConfig): RedactResult {
+private val LAN_SCRUB_SCHEMA = JSONObject(
+    "{\"type\":\"object\",\"properties\":{\"items\":{\"type\":\"array\",\"items\":{\"type\":\"object\"," +
+        "\"properties\":{\"kind\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"kind\",\"value\"]}}},\"required\":[\"items\"]}",
+)
+private val LAN_TRIAGE_SCHEMA = JSONObject(
+    "{\"type\":\"object\",\"properties\":{\"isError\":{\"type\":\"boolean\"},\"errorType\":{\"type\":\"string\"}," +
+        "\"language\":{\"type\":\"string\"},\"summary\":{\"type\":\"string\"},\"likelyCause\":{\"type\":\"string\"}," +
+        "\"quickFix\":{\"type\":\"string\"},\"severity\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"critical\"]}," +
+        "\"confidence\":{\"type\":\"number\"}},\"required\":[\"isError\",\"errorType\",\"language\",\"summary\",\"likelyCause\",\"quickFix\",\"severity\",\"confidence\"]}",
+)
+private const val LAN_SYSTEM = "Follow the user's instructions exactly and reply with JSON only."
+
+/** Models sometimes answer 80 instead of 0.8. */
+private fun normConfidence(v: Double): Double = (if (v > 1) v / 100 else v).coerceIn(0.0, 1.0)
+
+private fun parseTriage(o: JSONObject): Triage {
+    val isError = o.optBoolean("isError", true)
+    return Triage(
+        isError = isError,
+        errorType = o.optString("errorType", "Error"),
+        language = o.optString("language", "unknown"),
+        summary = o.optString("summary"),
+        likelyCause = o.optString("likelyCause"),
+        quickFix = o.optString("quickFix"),
+        severity = o.optString("severity", "medium").lowercase(),
+        confidence = if (isError) normConfidence(o.optDouble("confidence", 0.0)) else 0.0,
+    )
+}
+
+suspend fun redact(
+    raw: String,
+    device: DeviceStatus,
+    mode: ProcessingMode,
+    cfg: RoutingConfig,
+    engine: Engine = Engine.Builtin(),
+): RedactResult {
     val r = Redactor()
     val logs = mutableListOf<StepLog>()
     var t = System.currentTimeMillis()
     var text = r.applyRules(raw)
     logs += StepLog("Redact secrets (rules)", StepSource.LOCAL_RULES, System.currentTimeMillis() - t)
 
+    if (engine is Engine.Network && mode != ProcessingMode.CLOUD) {
+        // Contextual pass on a machine in your own network: still private.
+        t = System.currentTimeMillis()
+        return try {
+            val found = mutableListOf<Pair<String, String>>()
+            for (part in chunk(text, 12_000).take(4)) {
+                val items = parseJson(Lan.chat(engine.lan, LAN_SYSTEM, SCRUB_PROMPT + part, LAN_SCRUB_SCHEMA)).optJSONArray("items")
+                for (i in 0 until (items?.length() ?: 0)) {
+                    val o = items!!.getJSONObject(i)
+                    found += o.optString("kind", "PII") to o.optString("value")
+                }
+            }
+            text = r.applyLiterals(text, found)
+            logs += StepLog("Redact context (AI)", StepSource.LOCAL_NETWORK, System.currentTimeMillis() - t, engine.lan.model)
+            RedactResult(r, text, logs, modelRan = true)
+        } catch (e: Exception) {
+            logs += StepLog("Redact context (AI)", StepSource.SKIPPED, System.currentTimeMillis() - t, "${e.message} Rule-based redaction only.")
+            RedactResult(r, text, logs, modelRan = false)
+        }
+    }
+    val nano = (engine as? Engine.Builtin)?.nano ?: NanoOption.STABLE
     if (mode == ProcessingMode.CLOUD || device != DeviceStatus.AVAILABLE) {
         val why = if (mode == ProcessingMode.CLOUD) "Cloud mode" else "Gemini Nano not available"
         logs += StepLog("Redact context (AI)", StepSource.SKIPPED, 0, "$why: rule-based redaction only")
@@ -249,7 +322,8 @@ suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg:
     var ok = 0
     for (part in parts.take(maxChunks)) {
         try {
-            val res = scrubModel(cfg).generateContent(SCRUB_PROMPT + part)
+            // Slow devices can take minutes per chunk: give up after 45 s and fall back to review.
+            val res = kotlinx.coroutines.withTimeout(45_000) { scrubModel(cfg, nano).generateContent(SCRUB_PROMPT + part) }
             val items = parseJson(res.text).optJSONArray("items")
             for (i in 0 until (items?.length() ?: 0)) {
                 val o = items!!.getJSONObject(i)
@@ -275,7 +349,18 @@ suspend fun redact(raw: String, device: DeviceStatus, mode: ProcessingMode, cfg:
     return RedactResult(r, text, logs, modelRan = true)
 }
 
-suspend fun triage(sanitized: String, cfg: RoutingConfig, mode: ProcessingMode): Pair<Triage, StepLog> {
+suspend fun triage(
+    sanitized: String,
+    cfg: RoutingConfig,
+    mode: ProcessingMode,
+    engine: Engine = Engine.Builtin(),
+): Pair<Triage, StepLog> {
+    if (engine is Engine.Network && mode != ProcessingMode.CLOUD) {
+        val t0 = System.currentTimeMillis()
+        val tri = parseTriage(parseJson(Lan.chat(engine.lan, LAN_SYSTEM, TRIAGE_PROMPT + sanitized, LAN_TRIAGE_SCHEMA)))
+        return tri to StepLog("Quick triage", StepSource.LOCAL_NETWORK, System.currentTimeMillis() - t0, engine.lan.model)
+    }
+    val nano = (engine as? Engine.Builtin)?.nano ?: NanoOption.STABLE
     val limit = minOf(cfg.maxOnDeviceChars, ANDROID_ON_DEVICE_MAX_CHARS)
     val tooLong = sanitized.length > limit
     if (mode == ProcessingMode.PRIVATE && tooLong) {
@@ -287,19 +372,8 @@ suspend fun triage(sanitized: String, cfg: RoutingConfig, mode: ProcessingMode):
         else -> InferenceMode.PREFER_ON_DEVICE
     }
     val t = System.currentTimeMillis()
-    val res = triageModel(cfg, inference).generateContent(TRIAGE_PROMPT + sanitized)
-    val o = parseJson(res.text)
-    val isError = o.optBoolean("isError", true)
-    val tri = Triage(
-        isError = isError,
-        errorType = o.optString("errorType", "Error"),
-        language = o.optString("language", "unknown"),
-        summary = o.optString("summary"),
-        likelyCause = o.optString("likelyCause"),
-        quickFix = o.optString("quickFix"),
-        severity = o.optString("severity", "medium").lowercase(),
-        confidence = if (isError) o.optDouble("confidence", 0.0).coerceIn(0.0, 1.0) else 0.0,
-    )
+    val res = triageModel(cfg, inference, nano).generateContent(TRIAGE_PROMPT + sanitized)
+    val tri = parseTriage(parseJson(res.text))
     val fallback = if (inference == InferenceMode.ONLY_IN_CLOUD) StepSource.IN_CLOUD else StepSource.ON_DEVICE
     val note = when {
         mode == ProcessingMode.CLOUD -> "Cloud mode"
@@ -310,7 +384,7 @@ suspend fun triage(sanitized: String, cfg: RoutingConfig, mode: ProcessingMode):
 }
 
 /** Cloud only, sanitized text only. Emits accumulated Markdown. */
-fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig): Flow<String> {
+fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig, lan: LanConfig? = null): Flow<String> {
     val prompt = buildString {
         append(DEEP_PROMPT)
         if (tri != null) {
@@ -318,6 +392,8 @@ fun deepDive(sanitized: String, tri: Triage?, cfg: RoutingConfig): Flow<String> 
         }
         append("Sanitized trace:\n").append(sanitized)
     }
+    // Private deep dive on your own network's bigger model.
+    if (lan != null) return Lan.stream(lan, "You are a principal engineer.", prompt)
     val sb = StringBuilder()
     return deepModel(cfg).generateContentStream(prompt).map { chunk ->
         sb.append(chunk.text.orEmpty())

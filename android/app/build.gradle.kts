@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -19,10 +21,24 @@ android {
         versionName = "1.0"
     }
 
+    // Release signing from android/keystore.properties (git-ignored); falls back to debug signing.
+    val keystoreFile = rootProject.file("keystore.properties")
+    signingConfigs {
+        if (keystoreFile.exists()) {
+            val p = Properties().apply { keystoreFile.inputStream().use { load(it) } }
+            create("release") {
+                storeFile = rootProject.file(p.getProperty("storeFile"))
+                storePassword = p.getProperty("storePassword")
+                keyAlias = p.getProperty("keyAlias")
+                keyPassword = p.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     buildFeatures {

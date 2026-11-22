@@ -124,3 +124,25 @@ mark { background: var(--mark); color: var(--mark-ink); border-radius: 4px; padd
 .error.row { flex-wrap: nowrap; }
 .error .retry { flex-shrink: 0; background: transparent; color: inherit; border-color: currentColor; font-weight: 600; }
 .quota { font-size: 12px; color: var(--muted); margin-left: auto; margin-right: 10px; }
+.badge-local_network { background: #e6f6f8; color: #0e7490; }
+@media (prefers-color-scheme: dark) { .badge-local_network { background: #0c2a30; color: #67e8f9; } }
+
+/* settings sheet */
+.modal { position: fixed; inset: 0; background: rgba(10, 12, 20, .55); display: flex; justify-content: center; align-items: flex-start; padding: 40px 16px; overflow-y: auto; z-index: 10; }
+.sheet { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 20px; width: min(760px, 100%); display: flex; flex-direction: column; gap: 18px; }
+.sheet h3 { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+.sheet section { border-top: 1px solid var(--line); padding-top: 14px; }
+.radio, .toggle { display: flex; gap: 10px; align-items: flex-start; font-size: 13.5px; margin: 8px 0; cursor: pointer; }
+.radio input, .toggle input { margin-top: 3px; }
+.field { flex: 1; min-width: 0; font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--code); color: var(--ink); width: 100%; }
+.cmd { background: var(--code); padding: 8px 10px; border-radius: 8px; font-size: 12px; overflow-x: auto; margin: 6px 0; }
+.req { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+.req th, .req td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+.checks, .pages { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.pages code { word-break: break-all; }
+.check { display: flex; gap: 8px; align-items: baseline; }
+.dot { width: 18px; height: 18px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
+.dot-ok { background: var(--device-bg); color: var(--device); }
+.dot-bad { background: #fde1e1; color: var(--bad); }
+.dot-wait { background: var(--code); color: var(--muted); }
+details summary { cursor: pointer; }

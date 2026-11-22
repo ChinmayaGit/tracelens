@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let brand = Color(red: 0.43, green: 0.30, blue: 1.0)
 private let deviceGreen = Color(red: 0.09, green: 0.64, blue: 0.29)
@@ -12,6 +13,7 @@ private func color(_ s: StepSource) -> Color {
     case .onDevice: deviceGreen
     case .inCloud: cloudBlue
     case .localRules: rulesPurple
+    case .localNetwork: Color(red: 0.05, green: 0.45, blue: 0.56)
     case .skipped: .gray
     }
 }
@@ -64,9 +66,11 @@ struct Card<Content: View>: View {
 
 struct ContentView: View {
     @State private var model = AppModel()
+    @State private var showImporter = false
 
     var body: some View {
         NavigationStack {
+            ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 14) {
                     modeCard
@@ -76,7 +80,7 @@ struct ContentView: View {
                         banner("Offline: on-device steps still work; cloud steps resume when you reconnect.", warn)
                     }
                     if let e = model.run.error { errorBanner(e) }
-                    if !model.run.steps.isEmpty || model.run.pending != nil { pipeline }
+                    if !model.run.steps.isEmpty || model.run.pending != nil { pipeline.id("results") }
                     if model.run.review { ReviewCard(model: model) }
                     if let t = model.run.triage { triageCard(t) }
                     if !model.run.analysis.isEmpty {
@@ -89,10 +93,28 @@ struct ContentView: View {
                 }
                 .padding(16)
             }
+            // Bring results into view as soon as an analysis starts producing them.
+            .onChange(of: model.run.steps.count) { _, n in
+                if n > 0 { withAnimation { proxy.scrollTo("results", anchor: .top) } }
+            }
+            }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("TraceLens")
+            .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
+            .fileImporter(isPresented: $showImporter, allowedContentTypes: [.plainText, .log, .json, .data]) { result in
+                if case .success(let url) = result { model.importCrashFile(url) }
+            }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { devicePill }
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack {
+                        if model.useNetwork {
+                            Badge(text: model.lanStatus?.online == true ? "LAN online" : "LAN offline",
+                                  color: model.lanStatus?.online == true ? Color(red: 0.05, green: 0.45, blue: 0.56) : bad)
+                        } else { devicePill }
+                        Button { model.showSettings = true } label: { Image(systemName: "gearshape") }
+                            .accessibilityLabel("Settings")
+                    }
+                }
             }
         }
     }
@@ -119,6 +141,12 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             Text(model.mode.detail).font(.caption).foregroundStyle(.secondary)
+            if model.useNetwork {
+                banner(model.lanStatus?.online == true
+                       ? "Private steps run on \(model.lan.model.isEmpty ? "your server" : model.lan.model) at \(model.lan.url). Nothing leaves your network\(model.mode == .private ? ", including deep dives" : "")."
+                       : "Your local network server (\(model.lan.url)) is offline. Start it or switch to Built-in in Settings.",
+                       model.lanStatus?.online == true ? Color(red: 0.05, green: 0.45, blue: 0.56) : bad)
+            } else {
             switch model.device {
             case .notEnabled where model.mode != .cloud:
                 banner("Turn on Apple Intelligence in Settings to analyze privately on this device. Until then, TraceLens uses the cloud with local redaction and a review step.", warn)
@@ -127,6 +155,7 @@ struct ContentView: View {
             case .unavailable where model.mode != .cloud:
                 banner("This device can't run Apple Intelligence. TraceLens uses the cloud with local rule-based redaction and asks you to review before sending.", warn)
             default: EmptyView()
+            }
             }
         }
     }
@@ -182,6 +211,8 @@ struct ContentView: View {
                     }
                 }
             HStack {
+                Button { showImporter = true } label: { Image(systemName: "ladybug") }
+                    .accessibilityLabel("Import a crash log file")
                 Button { if let s = UIPasteboard.general.string { model.input = s } } label: {
                     Image(systemName: "doc.on.clipboard")
                 }
@@ -236,14 +267,15 @@ struct ContentView: View {
             let pct = Int(t.confidence * 100)
             ProgressView(value: t.confidence).tint(pct >= 75 ? deviceGreen : pct >= 50 ? warn : bad)
             Text("\(pct)% confident").font(.caption)
-            if model.run.analysis.isEmpty && model.run.pending == nil && model.mode != .private {
-                Button("Deep dive in cloud →") { model.startDeepDive() }.buttonStyle(.borderedProminent).tint(brand)
+            if model.run.analysis.isEmpty && model.run.pending == nil && (model.mode != .private || model.useNetwork) {
+                Button(model.mode == .private ? "Deep dive on my network →" : "Deep dive in cloud →") { model.startDeepDive() }
+                    .buttonStyle(.borderedProminent).tint(brand)
             }
         }
     }
 
     private var sanitizedCard: some View {
-        Card(title: "What the cloud sees") {
+        Card(title: model.mode == .private ? "Sanitized trace (stays private)" : "What the cloud sees") {
             Text(highlighted(model.run.sanitized))
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
@@ -407,6 +439,77 @@ struct MarkdownView: View {
                         .font(.subheadline)
                 }
             }
+        }
+    }
+}
+
+
+/// Engine choice (Apple Intelligence or a bigger model on your network) and requirements.
+struct SettingsView: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Engine", selection: $model.useNetwork) {
+                        Text("Built-in: Apple Intelligence").tag(false)
+                        Text("Bigger model on my network").tag(true)
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+                } header: {
+                    Text("Local AI engine")
+                } footer: {
+                    Text(model.useNetwork
+                         ? "A powerful computer on your Wi-Fi runs the model (Ollama). Nothing leaves your network."
+                         : "Default. Needs iPhone 15 Pro or newer (or M-series iPad/Mac), Apple Intelligence turned on in Settings, and ~7 GB free storage.")
+                }
+
+                if model.useNetwork {
+                    Section {
+                        HStack {
+                            TextField("http://192.168.1.20:11434", text: $model.lan.url)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                            Button("Test") { model.checkLan() }
+                        }
+                        if let st = model.lanStatus {
+                            Label(st.online ? "Online" : "Offline: \(st.error ?? "unreachable")",
+                                  systemImage: st.online ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                .foregroundStyle(st.online ? .green : .red)
+                        }
+                        if let st = model.lanStatus, st.online {
+                            Picker("Model", selection: $model.lan.model) {
+                                ForEach(st.models) { m in
+                                    Text("\(m.name) · \(m.params.isEmpty ? "\(m.sizeGb) GB" : m.params) · ~\(m.minRamGb) GB RAM").tag(m.name)
+                                }
+                            }
+                        }
+                        Toggle(isOn: $model.lan.memorySaver) {
+                            VStack(alignment: .leading) {
+                                Text("Memory saver (stream weights from disk)")
+                                Text("Memory-maps the model file so only the layers in use sit in RAM, smaller context window, unloads after 1 min idle. Lets a big model run on a smaller machine; the first answer is slower.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    } header: {
+                        Text("Local network server")
+                    } footer: {
+                        Text("On the server: OLLAMA_HOST=0.0.0.0 ollama serve. iOS will ask for Local Network permission the first time.")
+                    }
+                    Section("Recommended models (min RAM on the server)") {
+                        ForEach(recommendedLanModels, id: \.name) { m in
+                            VStack(alignment: .leading) {
+                                Text("\(m.name) · \(m.ram) GB").font(.subheadline.monospaced())
+                                Text(m.note).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.showSettings = false } } }
+            .onAppear { if model.useNetwork { model.checkLan() } }
         }
     }
 }

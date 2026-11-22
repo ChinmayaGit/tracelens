@@ -41,6 +41,15 @@ data class UiState(
     val notice: String? = null,
     val online: Boolean = true,
     val cloudLeft: Int = USER_DAILY_LIMIT,
+    /** false = built-in Gemini Nano (default); true = model on a local network server. */
+    val useNetwork: Boolean = false,
+    val nano: NanoOption = NanoOption.STABLE,
+    val lan: LanConfig = LanConfig(),
+    val lanStatus: LanStatus? = null,
+    val showSettings: Boolean = false,
+    val crashes: List<CrashEntry>? = null,
+    val crashesAllApps: Boolean = false,
+    val showCrashes: Boolean = false,
     val refreshing: Boolean = false,
 )
 
@@ -78,6 +87,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         _ui.update { it.copy(online = isOnline()) }
         runCatching { connectivity?.registerDefaultNetworkCallback(netCallback) }
+        loadEngine()
         viewModelScope.launch {
             val device = deviceStatus()
             val saved = prefs.getString("mode", null)?.let { runCatching { ProcessingMode.valueOf(it) }.getOrNull() }
@@ -144,6 +154,81 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setInput(v: String) = _ui.update { it.copy(input = v) }
 
+    /* ---------------- engine settings ---------------- */
+
+    private fun loadEngine() {
+        _ui.update {
+            it.copy(
+                useNetwork = prefs.getBoolean("useNetwork", false),
+                nano = runCatching { NanoOption.valueOf(prefs.getString("nano", "STABLE")!!) }.getOrDefault(NanoOption.STABLE),
+                lan = LanConfig(
+                    url = prefs.getString("lanUrl", LanConfig().url)!!,
+                    model = prefs.getString("lanModel", "")!!,
+                    memorySaver = prefs.getBoolean("lanMemorySaver", true),
+                ),
+            )
+        }
+        if (_ui.value.useNetwork) testLan()
+    }
+
+    fun showSettings(show: Boolean) = _ui.update { it.copy(showSettings = show) }
+
+    fun setUseNetwork(v: Boolean) {
+        prefs.edit().putBoolean("useNetwork", v).apply()
+        _ui.update { it.copy(useNetwork = v) }
+        if (v) testLan()
+    }
+
+    fun setNano(o: NanoOption) {
+        prefs.edit().putString("nano", o.name).apply()
+        resetModels()
+        _ui.update { it.copy(nano = o) }
+    }
+
+    fun setLan(l: LanConfig) {
+        prefs.edit().putString("lanUrl", l.url).putString("lanModel", l.model).putBoolean("lanMemorySaver", l.memorySaver).apply()
+        _ui.update { it.copy(lan = l) }
+    }
+
+    private var lanJob: Job? = null
+
+    /** Check the server now, then keep its Online/Offline status fresh every 15 s. */
+    fun testLan() {
+        lanJob?.cancel()
+        lanJob = viewModelScope.launch {
+            while (true) {
+                val st = Lan.status(_ui.value.lan.url)
+                _ui.update { s ->
+                    val model = if (s.lan.model.isEmpty() && st.online) st.models.firstOrNull()?.name.orEmpty() else s.lan.model
+                    s.copy(lanStatus = st, lan = s.lan.copy(model = model))
+                }
+                if (!_ui.value.useNetwork) break
+                kotlinx.coroutines.delay(15_000)
+            }
+        }
+    }
+
+    private fun engine(): Engine {
+        val s = _ui.value
+        return if (s.useNetwork && s.lanStatus?.online == true && s.lan.model.isNotEmpty()) Engine.Network(s.lan)
+        else Engine.Builtin(s.nano)
+    }
+
+    /* ---------------- debug installed apps ---------------- */
+
+    fun loadCrashes() {
+        val ctx = getApplication<Application>()
+        _ui.update { it.copy(showCrashes = true, crashes = null, crashesAllApps = Crashes.canReadAllApps(ctx)) }
+        viewModelScope.launch {
+            val list = runCatching { Crashes.recent() }.getOrDefault(emptyList())
+            _ui.update { it.copy(crashes = list) }
+        }
+    }
+
+    fun hideCrashes() = _ui.update { it.copy(showCrashes = false) }
+
+    fun pickCrash(c: CrashEntry) = _ui.update { it.copy(input = c.text, showCrashes = false) }
+
     fun setMode(m: ProcessingMode) {
         prefs.edit().putString("mode", m.name).apply()
         _ui.update { it.copy(mode = m) }
@@ -192,16 +277,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val dev = deviceStatus()
                 _ui.update { it.copy(device = dev) }
                 val mode = _ui.value.mode
-                if (mode == ProcessingMode.PRIVATE && dev != DeviceStatus.AVAILABLE) {
+                val eng = engine()
+                if (_ui.value.useNetwork && eng !is Engine.Network && mode != ProcessingMode.CLOUD) {
+                    error(
+                        if (_ui.value.lanStatus?.online == false) "Your local network server (${_ui.value.lan.url}) is offline. Start it, switch to Built-in in Settings, or use Cloud mode."
+                        else "Pick a model for your local network server in Settings.",
+                    )
+                }
+                if (mode == ProcessingMode.PRIVATE && dev != DeviceStatus.AVAILABLE && eng !is Engine.Network) {
                     error("Private mode needs Gemini Nano on this device. Switch to Hybrid or Cloud mode.")
                 }
                 require(raw.isNotEmpty()) { "Paste a stack trace or log first." }
                 require(looksLikeError(raw)) {
                     "That doesn't look like an error, stack trace or log. Paste the failing output (or try a sample)."
                 }
-                val nano = dev == DeviceStatus.AVAILABLE && mode != ProcessingMode.CLOUD
+                val nano = (dev == DeviceStatus.AVAILABLE || eng is Engine.Network) && mode != ProcessingMode.CLOUD
                 setRun { it.copy(pending = if (nano) "Redacting on-device…" else "Redacting with local rules…") }
-                val red = redact(raw, dev, mode, _ui.value.config)
+                val red = redact(raw, dev, mode, _ui.value.config, eng)
                 redactor = red.redactor
                 setRun { it.copy(sanitized = red.sanitized, redactions = red.redactor.redactions, steps = red.logs) }
 
@@ -237,10 +329,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val run = _ui.value.run
             val s = _ui.value
             // Count cloud calls only; Gemini Nano is free and unmetered.
-            val cloudPlanned = s.mode == ProcessingMode.CLOUD || s.device != DeviceStatus.AVAILABLE ||
+            val eng = engine()
+            val cloudPlanned = if (eng is Engine.Network && s.mode != ProcessingMode.CLOUD) false
+            else s.mode == ProcessingMode.CLOUD || s.device != DeviceStatus.AVAILABLE ||
                 run.sanitized.length > minOf(s.config.maxOnDeviceChars, 9_000)
             if (cloudPlanned) Quota.consume(uid)
-            val (tri, log) = triage(run.sanitized, _ui.value.config, _ui.value.mode)
+            val (tri, log) = triage(run.sanitized, _ui.value.config, _ui.value.mode, eng)
             // Hybrid may still fall back to the cloud if Nano fails: count it afterwards.
             if (!cloudPlanned && log.source == StepSource.IN_CLOUD) runCatching { Quota.consume(uid) }
             val steps = run.steps + log
@@ -263,22 +357,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun deepDiveNow() {
-        if (_ui.value.mode == ProcessingMode.PRIVATE) {
-            setRun { it.copy(error = "Private mode: nothing is sent to the cloud. Switch to Hybrid for a deep dive.") }
+        val eng = engine()
+        val viaLan = eng is Engine.Network && _ui.value.mode == ProcessingMode.PRIVATE
+        if (_ui.value.mode == ProcessingMode.PRIVATE && !viaLan) {
+            setRun { it.copy(error = "Private mode: nothing is sent to the cloud. Switch to Hybrid, or use a local network server for a private deep dive.") }
             return
         }
         val run = _ui.value.run
-        setRun { it.copy(pending = "Deep dive in the cloud (sanitized trace only)…", analysis = "", error = null) }
+        setRun {
+            it.copy(
+                pending = if (viaLan) "Deep dive on your network (${_ui.value.lan.model})…" else "Deep dive in the cloud (sanitized trace only)…",
+                analysis = "", error = null,
+            )
+        }
         val t = System.currentTimeMillis()
         try {
-            _ui.value.uid?.let { Quota.consume(it) }
+            if (!viaLan) _ui.value.uid?.let { Quota.consume(it) }
             var text = ""
-            deepDive(run.sanitized, run.triage, _ui.value.config).collect { acc ->
+            deepDive(run.sanitized, run.triage, _ui.value.config, (eng as? Engine.Network)?.lan?.takeIf { viaLan }).collect { acc ->
                 text = acc
                 setRun { it.copy(analysis = acc) }
             }
             val steps = run.steps.filter { it.step != "Root-cause deep dive" } +
-                StepLog("Root-cause deep dive", StepSource.IN_CLOUD, System.currentTimeMillis() - t)
+                StepLog("Root-cause deep dive", if (viaLan) StepSource.LOCAL_NETWORK else StepSource.IN_CLOUD, System.currentTimeMillis() - t)
             setRun { it.copy(steps = steps, pending = null) }
             val uid = _ui.value.uid
             val id = _ui.value.run.id
